@@ -16,14 +16,10 @@ import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 
 /**
- * Google Calendar write access for a no-GMS device, using the user's OWN
- * OAuth "Desktop app" client (created once in their Google Cloud console —
- * see the config page / README). Desktop clients permit any localhost
- * redirect, and there's no listener on the user's browser machine, so the
- * sign-in ends on a dead http://localhost:8090/oauth?code=… page; the user
- * pastes that URL back into the config page (or swaps localhost for the
- * Portal's IP, which hits ConfigServer's /oauth route directly). We exchange
- * the code for a refresh token and call the Calendar REST API from then on.
+ * Multi-account Google Calendar write access for a no-GMS device.
+ * Supports multiple family Gmail accounts, each with its own OAuth Desktop client.
+ * Stores accounts as JSON array in SharedPreferences ("g_accounts").
+ * Migrates old single-account keys on first use.
  */
 object GoogleCal {
     private const val REDIRECT = "http://localhost:8090/oauth"
@@ -43,51 +39,55 @@ object GoogleCal {
 
     private fun prefs(ctx: Context) = ctx.getSharedPreferences("config", Context.MODE_PRIVATE)
 
-    fun isConnected(ctx: Context): Boolean = !prefs(ctx).getString("g_refresh", null).isNullOrEmpty()
-    fun email(ctx: Context): String? = prefs(ctx).getString("g_email", null)
+    // --- Multi-account storage ---
 
-    /** id → display name pairs of writable calendars (cached at connect time). */
-    fun calendars(ctx: Context): List<Pair<String, String>> {
-        val arr = JSONArray(prefs(ctx).getString("g_cals", "[]"))
-        return (0 until arr.length()).map {
-            val o = arr.getJSONObject(it)
-            o.getString("id") to o.getString("name")
-        }
+    private fun accountsJson(ctx: Context): JSONArray {
+        migrateIfNeeded(ctx)
+        return JSONArray(prefs(ctx).getString("g_accounts", "[]"))
     }
 
-    fun disconnect(ctx: Context) {
-        prefs(ctx).edit()
+    private fun saveAccounts(ctx: Context, arr: JSONArray) {
+        prefs(ctx).edit().putString("g_accounts", arr.toString()).apply()
+    }
+
+    private fun migrateIfNeeded(ctx: Context) {
+        val p = prefs(ctx)
+        if (p.contains("g_accounts")) return
+        val refresh = p.getString("g_refresh", null)
+        if (refresh.isNullOrEmpty()) {
+            saveAccounts(ctx, JSONArray())
+            return
+        }
+        // Migrate single account
+        val acc = JSONObject()
+            .put("id", "migrated")
+            .put("clientId", p.getString("g_client_id", ""))
+            .put("clientSecret", p.getString("g_client_secret", ""))
+            .put("refreshToken", refresh)
+            .put("email", p.getString("g_email", ""))
+            .put("calendars", JSONArray(p.getString("g_cals", "[]")))
+        val arr = JSONArray().put(acc)
+        saveAccounts(ctx, arr)
+        // Clear old keys
+        p.edit()
             .remove("g_client_id").remove("g_client_secret")
             .remove("g_refresh").remove("g_access").remove("g_token_exp")
             .remove("g_cals").remove("g_email")
             .apply()
     }
 
-    /** Stores the OAuth client and returns the URL the user signs in at. */
-    fun begin(ctx: Context, clientId: String, clientSecret: String): String {
-        if (clientId.isEmpty() || clientSecret.isEmpty())
-            throw IllegalArgumentException("enter both the Client ID and the Client secret")
-        prefs(ctx).edit()
-            .putString("g_client_id", clientId)
-            .putString("g_client_secret", clientSecret)
-            .apply()
-        fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
-        return "https://accounts.google.com/o/oauth2/v2/auth" +
-            "?client_id=" + enc(clientId) +
-            "&redirect_uri=" + enc(REDIRECT) +
-            "&response_type=code&access_type=offline&prompt=consent" +
-            "&scope=" + enc(SCOPES)
+    fun accounts(ctx: Context): List<JSONObject> {
+        val arr = accountsJson(ctx)
+        return (0 until arr.length()).map { arr.getJSONObject(it) }
     }
 
-    /** Accepts the auth code, or the whole localhost URL the browser landed on. */
-    fun finish(ctx: Context, codeOrUrl: String): List<Pair<String, String>> {
+    fun isConnected(ctx: Context): Boolean = accountsJson(ctx).length() > 0
+
+    fun addAccount(ctx: Context, clientId: String, clientSecret: String, codeOrUrl: String): JSONObject {
+        // Similar to old finish, but for new account
         val code = Regex("[?&]code=([^&\\s]+)").find(codeOrUrl)?.groupValues?.get(1)
             ?: codeOrUrl.trim().takeIf { it.isNotEmpty() && !it.contains("://") }
-            ?: throw IllegalArgumentException("couldn't find a code in that — paste the full localhost URL or just the code value")
-        val p = prefs(ctx)
-        val clientId = p.getString("g_client_id", null)
-            ?: throw IllegalArgumentException("enter the Client ID/secret and get a sign-in link first")
-        val clientSecret = p.getString("g_client_secret", "")!!
+            ?: throw IllegalArgumentException("couldn't find a code")
 
         val resp = postForm(TOKEN_URL, FormBody.Builder()
             .add("code", java.net.URLDecoder.decode(code, "UTF-8"))
@@ -98,49 +98,112 @@ object GoogleCal {
             .build())
         val refresh = resp.optString("refresh_token", "")
         if (refresh.isEmpty())
-            throw IllegalArgumentException("Google didn't return a refresh token — remove this app at myaccount.google.com/permissions and sign in again")
-        p.edit()
-            .putString("g_refresh", refresh)
-            .putString("g_access", resp.getString("access_token"))
-            .putLong("g_token_exp", System.currentTimeMillis() + resp.optLong("expires_in", 3600) * 1000)
-            .apply()
+            throw IllegalArgumentException("Google didn't return a refresh token")
 
-        val cals = fetchCalendars(ctx)
-        if (cals.isEmpty())
-            throw IllegalArgumentException("signed in, but no writable Google calendars were found")
-        val arr = JSONArray()
-        cals.forEach { arr.put(JSONObject().put("id", it.first).put("name", it.second)) }
-        p.edit().putString("g_cals", arr.toString()).apply()
-        return cals
+        // Fetch calendars with this token
+        val token = resp.getString("access_token")
+        val cals = fetchCalendarsWithToken(token)
+        val email = cals.firstOrNull { it.second.contains("@") }?.second ?: "unknown"
+
+        val acc = JSONObject()
+            .put("id", "acc_" + System.currentTimeMillis())
+            .put("clientId", clientId)
+            .put("clientSecret", clientSecret)
+            .put("refreshToken", refresh)
+            .put("email", email)
+            .put("calendars", JSONArray().apply {
+                cals.forEach { put(JSONObject().put("id", it.first).put("name", it.second)) }
+            })
+
+        val arr = accountsJson(ctx)
+        arr.put(acc)
+        saveAccounts(ctx, arr)
+        return acc
     }
 
-    /**
-     * Deletes the event with this iCal UID from whichever writable calendar
-     * holds it (matched via events.list?iCalUID). Returns true if removed.
-     * For a repeating event this targets the series master → all occurrences.
-     */
+    fun removeAccount(ctx: Context, accountId: String) {
+        val arr = accountsJson(ctx)
+        val newArr = JSONArray()
+        for (i in 0 until arr.length()) {
+            val o = arr.getJSONObject(i)
+            if (o.getString("id") != accountId) newArr.put(o)
+        }
+        saveAccounts(ctx, newArr)
+    }
+
+    // --- Token management per account ---
+
+    private fun accessTokenFor(ctx: Context, account: JSONObject): String {
+        // Simplified: always refresh for now; cache can be added later
+        val resp = postForm(TOKEN_URL, FormBody.Builder()
+            .add("client_id", account.getString("clientId"))
+            .add("client_secret", account.getString("clientSecret"))
+            .add("refresh_token", account.getString("refreshToken"))
+            .add("grant_type", "refresh_token")
+            .build())
+        return resp.getString("access_token")
+    }
+
+    private fun fetchCalendarsWithToken(token: String): List<Pair<String, String>> {
+        val req = Request.Builder()
+            .url("$API/users/me/calendarList?minAccessRole=writer&maxResults=100")
+            .header("Authorization", "Bearer $token")
+            .build()
+        client.newCall(req).execute().use { resp ->
+            if (resp.code !in 200..299)
+                throw IllegalArgumentException("couldn't list Google calendars (HTTP ${resp.code})")
+            val items = JSONObject(resp.body?.string() ?: "{}").optJSONArray("items") ?: JSONArray()
+            val out = ArrayList<Pair<String, String>>()
+            for (i in 0 until items.length()) {
+                val o = items.getJSONObject(i)
+                out.add(o.getString("id") to
+                    (o.optString("summaryOverride").takeIf { it.isNotEmpty() }
+                        ?: o.optString("summary", o.getString("id"))))
+            }
+            return out
+        }
+    }
+
+    // --- Public API updates ---
+
+    fun calendars(ctx: Context): List<Pair<String, String>> {
+        val all = mutableListOf<Pair<String, String>>()
+        for (acc in accounts(ctx)) {
+            val cals = acc.optJSONArray("calendars") ?: continue
+            for (i in 0 until cals.length()) {
+                val o = cals.getJSONObject(i)
+                all.add(o.getString("id") to o.getString("name"))
+            }
+        }
+        return all
+    }
+
     fun deleteByUid(ctx: Context, uid: String): Boolean {
         if (!isConnected(ctx) || uid.isBlank()) return false
-        val token = accessToken(ctx)
-        fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
-        for ((calId, _) in calendars(ctx)) {
-            val listReq = Request.Builder()
-                .url("$API/calendars/${enc(calId)}/events?iCalUID=${enc(uid)}&showDeleted=false&maxResults=10")
-                .header("Authorization", "Bearer $token").get().build()
-            val items = client.newCall(listReq).execute().use { r ->
-                if (r.code !in 200..299) return@use null
-                JSONObject(r.body?.string() ?: "{}").optJSONArray("items")
-            } ?: continue
-            for (i in 0 until items.length()) {
-                val id = items.getJSONObject(i).optString("id")
-                if (id.isEmpty()) continue
-                val delReq = Request.Builder()
-                    .url("$API/calendars/${enc(calId)}/events/${enc(id)}")
-                    .header("Authorization", "Bearer $token").delete().build()
-                val ok = client.newCall(delReq).execute().use {
-                    it.code in 200..299 || it.code == 404 || it.code == 410 // already gone = success
+        for (acc in accounts(ctx)) {
+            val token = accessTokenFor(ctx, acc)
+            val cals = acc.optJSONArray("calendars") ?: continue
+            fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
+            for (i in 0 until cals.length()) {
+                val calId = cals.getJSONObject(i).getString("id")
+                val listReq = Request.Builder()
+                    .url("$API/calendars/${enc(calId)}/events?iCalUID=${enc(uid)}&showDeleted=false&maxResults=10")
+                    .header("Authorization", "Bearer $token").get().build()
+                val items = client.newCall(listReq).execute().use { r ->
+                    if (r.code !in 200..299) return@use null
+                    JSONObject(r.body?.string() ?: "{}").optJSONArray("items")
+                } ?: continue
+                for (j in 0 until items.length()) {
+                    val id = items.getJSONObject(j).optString("id")
+                    if (id.isEmpty()) continue
+                    val delReq = Request.Builder()
+                        .url("$API/calendars/${enc(calId)}/events/${enc(id)}")
+                        .header("Authorization", "Bearer $token").delete().build()
+                    val ok = client.newCall(delReq).execute().use {
+                        it.code in 200..299 || it.code == 404 || it.code == 410
+                    }
+                    if (ok) return true
                 }
-                if (ok) return true
             }
         }
         return false
@@ -148,6 +211,21 @@ object GoogleCal {
 
     fun addEvent(ctx: Context, calendarId: String, title: String,
                  startMillis: Long, endMillis: Long, allDay: Boolean) {
+        // Find which account owns this calendar
+        var targetAcc: JSONObject? = null
+        for (acc in accounts(ctx)) {
+            val cals = acc.optJSONArray("calendars") ?: continue
+            for (i in 0 until cals.length()) {
+                if (cals.getJSONObject(i).getString("id") == calendarId) {
+                    targetAcc = acc
+                    break
+                }
+            }
+            if (targetAcc != null) break
+        }
+        val acc = targetAcc ?: throw IllegalArgumentException("No account owns calendar $calendarId")
+        val token = accessTokenFor(ctx, acc)
+
         val utc = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
             .apply { timeZone = TimeZone.getTimeZone("UTC") }
         val day = SimpleDateFormat("yyyy-MM-dd", Locale.US)
@@ -161,66 +239,42 @@ object GoogleCal {
             .put("end", side(endMillis))
         val req = Request.Builder()
             .url("$API/calendars/${URLEncoder.encode(calendarId, "UTF-8")}/events")
-            .header("Authorization", "Bearer " + accessToken(ctx))
+            .header("Authorization", "Bearer $token")
             .post(body.toString().toRequestBody(JSON))
             .build()
         client.newCall(req).execute().use { resp ->
             if (resp.code !in 200..299)
-                throw IllegalArgumentException("Google refused the event (HTTP ${resp.code}) — try reconnecting Google")
+                throw IllegalArgumentException("Google refused the event (HTTP ${resp.code})")
         }
     }
 
-    /** A fresh access token for sibling Google APIs (Tasks). */
-    fun bearer(ctx: Context): String = accessToken(ctx)
-
-    // ------------------------------------------------------------ plumbing
-
-    private fun accessToken(ctx: Context): String {
-        val p = prefs(ctx)
-        val cached = p.getString("g_access", null)
-        if (cached != null && System.currentTimeMillis() < p.getLong("g_token_exp", 0) - 60_000)
-            return cached
-        val refresh = p.getString("g_refresh", null)
-            ?: throw IllegalArgumentException("Google isn't connected yet")
-        val resp = postForm(TOKEN_URL, FormBody.Builder()
-            .add("client_id", p.getString("g_client_id", "")!!)
-            .add("client_secret", p.getString("g_client_secret", "")!!)
-            .add("refresh_token", refresh)
-            .add("grant_type", "refresh_token")
-            .build())
-        val token = resp.getString("access_token")
-        val edit = p.edit()
-            .putString("g_access", token)
-            .putLong("g_token_exp", System.currentTimeMillis() + resp.optLong("expires_in", 3600) * 1000)
-        // If Google ever rotates the refresh token, persist it BEFORE using
-        // anything — a rotated-but-unpersisted token bricks the connection.
-        resp.optString("refresh_token").takeIf { it.isNotEmpty() }
-            ?.let { edit.putString("g_refresh", it) }
-        edit.commit() // synchronous: a crash right after must not lose this
-        return token
+    fun bearer(ctx: Context): String {
+        // For Tasks: use first account for now
+        val accs = accounts(ctx)
+        if (accs.isEmpty()) throw IllegalArgumentException("No Google accounts connected")
+        return accessTokenFor(ctx, accs[0])
     }
 
-    private fun fetchCalendars(ctx: Context): List<Pair<String, String>> {
-        val req = Request.Builder()
-            .url("$API/users/me/calendarList?minAccessRole=writer&maxResults=100")
-            .header("Authorization", "Bearer " + accessToken(ctx))
-            .build()
-        client.newCall(req).execute().use { resp ->
-            if (resp.code !in 200..299)
-                throw IllegalArgumentException("couldn't list Google calendars (HTTP ${resp.code})")
-            val items = JSONObject(resp.body?.string() ?: "{}").optJSONArray("items") ?: JSONArray()
-            val out = ArrayList<Pair<String, String>>()
-            for (i in 0 until items.length()) {
-                val o = items.getJSONObject(i)
-                if (o.optBoolean("primary", false))
-                    prefs(ctx).edit().putString("g_email", o.getString("id")).apply()
-                out.add(o.getString("id") to
-                    (o.optString("summaryOverride").takeIf { it.isNotEmpty() }
-                        ?: o.optString("summary", o.getString("id"))))
-            }
-            return out
-        }
+    // Legacy methods for compatibility during transition
+    fun begin(ctx: Context, clientId: String, clientSecret: String): String {
+        fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
+        return "https://accounts.google.com/o/oauth2/v2/auth" +
+            "?client_id=" + enc(clientId) +
+            "&redirect_uri=" + enc(REDIRECT) +
+            "&response_type=code&access_type=offline&prompt=consent" +
+            "&scope=" + enc(SCOPES)
     }
+
+    fun finish(ctx: Context, codeOrUrl: String): List<Pair<String, String>> {
+        // Deprecated: use addAccount
+        throw UnsupportedOperationException("Use addAccount for multi-account")
+    }
+
+    fun disconnect(ctx: Context) {
+        saveAccounts(ctx, JSONArray())
+    }
+
+    fun email(ctx: Context): String? = accounts(ctx).firstOrNull()?.optString("email")
 
     private fun postForm(url: String, form: FormBody): JSONObject {
         val req = Request.Builder().url(url).post(form).build()
