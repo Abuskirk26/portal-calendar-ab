@@ -1,0 +1,17 @@
+{
+  "updated_at": "yesterday",
+  "aisles": [
+    {
+      "aisle": "Pantry",
+      "entries": [
+        {"itemId": "pasta", "title": "Spaghetti", "qty": "1", "units": "lb", "done": "yes"},
+        {"id": "", "name": "skip blank id"},
+        {"name": "no id"},
+        "not an object",
+        {"id": "tomatoes", "name": "Crushed tomatoes", "quantity": 2.5, "checked": 0},
+        {"id": "oil", "text": "Olive oil", "amount": "1", "unit": "bottle", "purchased": 1}
+      ]
+    },
+    {"name": "Empty", "items": []}
+  ]
+}

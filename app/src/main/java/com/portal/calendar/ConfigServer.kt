@@ -92,6 +92,19 @@ class ConfigServer(
             json(Meals.statusJson(ctx))
         s.uri == "/api/meals" && s.method == Method.POST ->
             json(Meals.mutate(ctx, org.json.JSONObject(readBody(s))))
+        s.uri == "/api/kitchen" && s.method == Method.GET ->
+            json(store.kitchenStatusJson()) // token stays on the device
+        s.uri == "/api/kitchen" && s.method == Method.POST -> {
+            val o = org.json.JSONObject(readBody(s))
+            val was = store.kitchenConfigured()
+            store.setKitchen(o.optString("base"), if (o.has("token")) o.optString("token") else "")
+            // First time it's connected, show the Grocery tab. Clearing the URL hides it.
+            if (store.kitchenConfigured() && !was) store.setFeature("grocery", true)
+            if (!store.kitchenConfigured()) store.setFeature("grocery", false)
+            App.instance.notifyDataChanged()
+            onConfigChanged()
+            json(store.kitchenStatusJson())
+        }
         s.uri == "/api/ai" && s.method == Method.GET ->
             json(Gemini.statusJson(ctx))
         s.uri == "/api/ai" && s.method == Method.POST -> {
@@ -129,7 +142,7 @@ class ConfigServer(
             json(featuresJson())
         s.uri == "/api/features" && s.method == Method.POST -> {
             val o = org.json.JSONObject(readBody(s))
-            for (key in listOf("chores", "lists", "meals", "routines"))
+            for (key in listOf("chores", "lists", "meals", "routines", "grocery"))
                 if (o.has(key)) store.setFeature(key, o.getBoolean(key))
             App.instance.notifyDataChanged()
             json(featuresJson())
@@ -341,6 +354,7 @@ class ConfigServer(
         .put("lists", store.featureEnabled("lists"))
         .put("meals", store.featureEnabled("meals"))
         .put("routines", store.featureEnabled("routines", default = false))
+        .put("grocery", store.featureEnabled("grocery", default = false))
         .toString()
 
     private fun json(body: String) =

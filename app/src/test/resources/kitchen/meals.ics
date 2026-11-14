@@ -1,0 +1,18 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Families Kitchen//Hub//EN
+BEGIN:VEVENT
+UID:dinner-pasta
+DTSTART:20261114T180000
+DTEND:20261114T190000
+SUMMARY:🍲 Pasta primavera
+URL:https://families-kitchen.example/cook/pasta
+END:VEVENT
+BEGIN:VEVENT
+UID:lunch-salad
+DTSTART:20261114T120000
+DTEND:20261114T123000
+SUMMARY:Chicken salad
+DESCRIPTION:Cook now https://families-kitchen.example/cook/salad.
+END:VEVENT
+END:VCALENDAR

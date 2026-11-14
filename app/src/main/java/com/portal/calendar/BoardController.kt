@@ -17,6 +17,9 @@ import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.ScrollView
 import android.widget.TextView
 import com.google.zxing.BarcodeFormat
@@ -69,7 +72,7 @@ class BoardController(private val baseCtx: Context) {
     private var lastDayStamp = ""
     private var statusLine = "Starting…"
 
-    // Top-level tabs: 0=Calendar 1=Chores 2=Lists 3=Meals 4=Routines
+    // Top-level tabs: 0=Calendar 1=Chores 2=Lists 3=Meals 4=Routines 5=Grocery
     private var currentTab = 0
     private lateinit var tabButtons: List<TextView>
     private lateinit var tabPanels: List<View>
@@ -77,6 +80,7 @@ class BoardController(private val baseCtx: Context) {
     private lateinit var choresTab: ChoresTab
     private lateinit var mealsTab: MealsTab
     private lateinit var routinesTab: RoutinesTab
+    private lateinit var groceryTab: GroceryTab
 
     private lateinit var clockText: TextView
     private lateinit var dateText: TextView
@@ -84,6 +88,9 @@ class BoardController(private val baseCtx: Context) {
     private lateinit var dayWxViews: List<TextView>
     private lateinit var statusText: TextView
     private lateinit var todayList: LinearLayout
+    private lateinit var dinnerCard: LinearLayout
+    private lateinit var dinnerTitle: TextView
+    private lateinit var dinnerMeta: TextView
     private lateinit var legendList: LinearLayout
     private lateinit var monthLabel: TextView
     private lateinit var dayNameViews: List<TextView>
@@ -111,7 +118,11 @@ class BoardController(private val baseCtx: Context) {
     private lateinit var detailTitle: TextView
     private lateinit var detailBody: TextView
     private lateinit var detailDeleteBtn: TextView
+    private lateinit var detailCookBtn: TextView
     private var detailEvent: EventInstance? = null
+    private lateinit var cookOverlay: FrameLayout
+    private lateinit var cookWeb: WebView
+    private lateinit var cookTitle: TextView
     private lateinit var dayOverlay: FrameLayout
     private lateinit var dayTitle: TextView
     private lateinit var dayListBox: LinearLayout
@@ -167,6 +178,12 @@ class BoardController(private val baseCtx: Context) {
             handler.postDelayed(this, SYNC_INTERVAL_MS)
         }
     }
+    private val groceryTick = object : Runnable {
+        override fun run() {
+            if (::groceryTab.isInitialized) groceryTab.refresh()
+            handler.postDelayed(this, KitchenHub.POLL_MS)
+        }
+    }
     private var builtWeekStart = store.weekStart()
     private var builtOrientation = store.orientation()
     private var builtTheme = store.theme()
@@ -197,6 +214,7 @@ class BoardController(private val baseCtx: Context) {
             statusLine = "Config updated — syncing…"
             renderAll()
             doSync()
+            if (::groceryTab.isInitialized) groceryTab.refresh()
         }
     }
 
@@ -229,6 +247,7 @@ class BoardController(private val baseCtx: Context) {
             2 -> listsTab.render()
             3 -> mealsTab.render()
             4 -> routinesTab.render()
+            5 -> groceryTab.render()
         }
         refreshFocusables()
     }
@@ -255,7 +274,8 @@ class BoardController(private val baseCtx: Context) {
             store.featureEnabled("chores"),
             store.featureEnabled("lists"),
             store.featureEnabled("meals"),
-            store.featureEnabled("routines", default = false))
+            store.featureEnabled("routines", default = false),
+            store.featureEnabled("grocery", default = false))
         tabButtons.forEachIndexed { i, b ->
             b.visibility = if (flags[i]) View.VISIBLE else View.GONE
         }
@@ -271,17 +291,24 @@ class BoardController(private val baseCtx: Context) {
         App.instance.addConfigListener(configListener)
         App.instance.addDataListener(dataListener)
         events = App.instance.lastEvents // paint instantly; sync refreshes shortly
+        groceryTab.warm()
         applyFeatures()
         exitButton.visibility = if (onExit != null) View.VISIBLE else View.GONE
         renderAll()
         handler.post(clockTick)
         handler.post(syncTick)
+        handler.post(groceryTick)
     }
 
     @Volatile private var stopped = false
 
     fun stop() {
         stopped = true // in-flight async callbacks (voice, sync, delete) become no-ops
+        if (::groceryTab.isInitialized) groceryTab.stopped = true
+        if (::cookWeb.isInitialized) {
+            cookWeb.stopLoading()
+            cookWeb.loadUrl("about:blank")
+        }
         handler.removeCallbacksAndMessages(null)
         App.instance.removeConfigListener(configListener)
         App.instance.removeDataListener(dataListener)
@@ -292,6 +319,12 @@ class BoardController(private val baseCtx: Context) {
     /** Returns true if an overlay was open and got closed (for Back handling). */
     fun closeOverlays(): Boolean {
         var closed = false
+        if (::cookOverlay.isInitialized && cookOverlay.visibility == View.VISIBLE) {
+            cookWeb.stopLoading()
+            cookWeb.loadUrl("about:blank")
+            cookOverlay.visibility = View.GONE
+            closed = true
+        }
         if (pinOverlay.visibility == View.VISIBLE) {
             pinOverlay.visibility = View.GONE; closed = true
         }
@@ -422,7 +455,7 @@ class BoardController(private val baseCtx: Context) {
     private fun doSync() {
         Thread { Weather.maybeRefresh(ctx) }.start()
         App.instance.kickTasksSync(0)
-        if (store.feeds().isEmpty()) {
+        if (store.feeds().isEmpty() && !store.kitchenConfigured()) {
             events = emptyList()
             statusLine = "No calendars configured yet"
             renderAll()
@@ -508,6 +541,8 @@ class BoardController(private val baseCtx: Context) {
         })
         voiceOverlay = buildVoiceOverlay()
         root.addView(voiceOverlay, FrameLayout.LayoutParams(MATCH, MATCH))
+        cookOverlay = buildCookOverlay()
+        root.addView(cookOverlay, FrameLayout.LayoutParams(MATCH, MATCH))
 
         // Topmost, touch-transparent layer for chore-completion confetti.
         celebration = CelebrationView(ctx)
@@ -1491,6 +1526,45 @@ class BoardController(private val baseCtx: Context) {
         }
         side.addView(weatherText, lpMatchWrap(top = dp(8)))
 
+        dinnerCard = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            minimumHeight = dp(64)
+            background = rounded(mix(KitchenAdapter.MEAL_COLOR, CARD, 0.88f), 12)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            isClickable = true
+            isFocusable = true
+        }
+        dinnerCard.addView(TextView(ctx).apply {
+            text = KitchenAdapter.MEAL_ICON
+            textSize = 22f
+            gravity = Gravity.CENTER
+        }, LinearLayout.LayoutParams(dp(36), dp(36)).apply { rightMargin = dp(10) })
+        val dinnerCol = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
+        dinnerCol.addView(TextView(ctx).apply {
+            text = "TONIGHT'S DINNER"
+            textSize = 11f
+            setTextColor(KitchenAdapter.MEAL_COLOR)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            letterSpacing = 0.08f
+        })
+        dinnerTitle = TextView(ctx).apply {
+            textSize = 16f
+            setTextColor(INK)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        dinnerCol.addView(dinnerTitle)
+        dinnerMeta = TextView(ctx).apply {
+            textSize = 12f
+            setTextColor(MUTED)
+        }
+        dinnerCol.addView(dinnerMeta)
+        dinnerCard.addView(dinnerCol, LinearLayout.LayoutParams(0, WRAP, 1f))
+        side.addView(dinnerCard, lpMatchWrap(top = dp(12)))
+
         side.addView(View(ctx).apply { setBackgroundColor(LINE) },
             LinearLayout.LayoutParams(MATCH, dp(1)).apply {
                 topMargin = dp(18); bottomMargin = dp(16)
@@ -1558,7 +1632,7 @@ class BoardController(private val baseCtx: Context) {
             setPadding(dp(22), dp(12), dp(22), 0)
         }
         val tabs = ArrayList<TextView>()
-        listOf("Calendar", "Chores", "Lists", "Meals", "Routines").forEachIndexed { i, label ->
+        listOf("Calendar", "Chores", "Lists", "Meals", "Routines", "Grocery").forEachIndexed { i, label ->
             val t = TextView(ctx).apply {
                 text = label
                 textSize = 15f
@@ -1574,7 +1648,10 @@ class BoardController(private val baseCtx: Context) {
             tabs.add(t)
         }
         tabButtons = tabs
-        outer.addView(tabRow, lpMatchWrap())
+        outer.addView(HorizontalScrollView(ctx).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(tabRow)
+        }, lpMatchWrap())
 
         val area = FrameLayout(ctx)
         outer.addView(area, LinearLayout.LayoutParams(MATCH, 0, 1f))
@@ -1627,7 +1704,9 @@ class BoardController(private val baseCtx: Context) {
                 }
             })
         area.addView(routinesTab.view, FrameLayout.LayoutParams(MATCH, MATCH))
-        tabPanels = listOf(weekPanel, choresTab.view, listsTab.view, mealsTab.view, routinesTab.view)
+        groceryTab = GroceryTab(ctx)
+        area.addView(groceryTab.view, FrameLayout.LayoutParams(MATCH, MATCH))
+        tabPanels = listOf(weekPanel, choresTab.view, listsTab.view, mealsTab.view, routinesTab.view, groceryTab.view)
 
         // Nav row -------------------------------------------------------
         // Portrait is too narrow to fit the title + all controls on one line
@@ -1833,6 +1912,7 @@ class BoardController(private val baseCtx: Context) {
             2 -> listsTab.render()
             3 -> mealsTab.render()
             4 -> routinesTab.render()
+            5 -> groceryTab.show()
         }
         refreshFocusables()
     }
@@ -1850,7 +1930,7 @@ class BoardController(private val baseCtx: Context) {
 
     /** Calendar tab shows either the board or the first-run QR panel. */
     private fun updateEmptyState() {
-        val empty = store.feeds().isEmpty()
+        val empty = store.feeds().isEmpty() && !store.kitchenConfigured()
         val cal = currentTab == 0
         weekPanel.visibility = if (cal && !empty) View.VISIBLE else View.GONE
         setupPanel.visibility = if (cal && empty) View.VISIBLE else View.GONE
@@ -1976,7 +2056,10 @@ class BoardController(private val baseCtx: Context) {
         }
         card.addView(overlayUrl, lpMatchWrap(top = dp(12)))
         card.addView(TextView(ctx).apply {
-            text = "Works with Google and Apple (iCloud) calendars —\nstep-by-step instructions are on the page"
+            text = if (store.kitchenConfigured())
+                "Families Kitchen is connected — meals and the grocery list sync from it.\nOther calendars are managed on the setup page."
+            else
+                "Works with Google and Apple (iCloud) calendars —\nstep-by-step instructions are on the page. Families Kitchen is connected there too."
             textSize = 13f
             setTextColor(MUTED)
             gravity = Gravity.CENTER
@@ -2299,6 +2382,15 @@ class BoardController(private val baseCtx: Context) {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.END
         }
+        detailCookBtn = accentButton("Cook now") {
+            val url = detailEvent?.url
+            if (!url.isNullOrEmpty()) {
+                detailOverlay.visibility = View.GONE
+                openCook(url)
+            }
+        }
+        detailCookBtn.visibility = View.GONE
+        btnRow.addView(detailCookBtn)
         detailDeleteBtn = navButton("🗑 Remove") { requirePin { deleteCurrentEvent() } }.apply {
             setTextColor(0xFFE0556A.toInt())
         }
@@ -2353,11 +2445,13 @@ class BoardController(private val baseCtx: Context) {
         detailEvent = ev
         // Removable only when it carries a UID and an account that holds it is
         // connected for two-way sync — otherwise the delete couldn't propagate.
-        val canDelete = ev.uid.isNotEmpty() &&
+        val canDelete = !ev.meal && ev.uid.isNotEmpty() &&
             (GoogleCal.isConnected(ctx) || CalDav.isConnected(ctx))
         detailDeleteBtn.visibility = if (canDelete) View.VISIBLE else View.GONE
+        val cook = ev.url
+        detailCookBtn.visibility = if (ev.meal && !cook.isNullOrEmpty()) View.VISIBLE else View.GONE
         val dayFmt = SimpleDateFormat("EEE, MMM d", Locale.getDefault())
-        detailTitle.text = ev.title
+        detailTitle.text = if (ev.meal) KitchenAdapter.withMealIcon(ev.title) else ev.title
         detailBody.text = buildString {
             append(if (ev.allDay) "All day · " + dayFmt.format(ev.start)
                    else dayFmt.format(ev.start) + " · " +
@@ -2438,10 +2532,10 @@ class BoardController(private val baseCtx: Context) {
             row.addView(View(ctx).apply { background = rounded(ev.color, 3) },
                 LinearLayout.LayoutParams(dp(4), dp(26)).apply { rightMargin = dp(10) })
             row.addView(TextView(ctx).apply {
-                text = if (ev.allDay) "All day" else timeFormat().format(ev.start)
+                text = mealWhen(ev, if (ev.allDay) "All day" else timeFormat().format(ev.start))
                 textSize = 13f
                 setTextColor(MUTED)
-            }, LinearLayout.LayoutParams(dp(82), WRAP))
+            }, LinearLayout.LayoutParams(dp(108), WRAP))
             row.addView(TextView(ctx).apply {
                 text = ev.title
                 textSize = 15f
@@ -2488,7 +2582,7 @@ class BoardController(private val baseCtx: Context) {
         // All-day events ride a pinned strip above the timeline.
         for (ev in allDay) {
             dayBox.addView(TextView(ctx).apply {
-                text = "  " + ev.title
+                text = "  " + mealTitle(ev)
                 textSize = 15f
                 setTextColor(INK)
                 maxLines = 1
@@ -2570,7 +2664,7 @@ class BoardController(private val baseCtx: Context) {
                 LinearLayout.LayoutParams(dp(4), MATCH).apply { rightMargin = dp(7) })
             val textCol = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
             textCol.addView(TextView(ctx).apply {
-                text = ev.title
+                text = mealTitle(ev)
                 textSize = 14f
                 setTextColor(INK)
                 typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
@@ -2670,10 +2764,10 @@ class BoardController(private val baseCtx: Context) {
                     }
                 }, LinearLayout.LayoutParams(dp(12), dp(12)).apply { rightMargin = dp(12) })
                 row.addView(TextView(ctx).apply {
-                    text = if (ev.allDay) "All day" else timeFormat().format(ev.start)
+                    text = mealWhen(ev, if (ev.allDay) "All day" else timeFormat().format(ev.start))
                     textSize = 14f
                     setTextColor(MUTED)
-                }, LinearLayout.LayoutParams(dp(96), WRAP))
+                }, LinearLayout.LayoutParams(dp(120), WRAP))
                 row.addView(TextView(ctx).apply {
                     text = ev.title
                     textSize = 16f
@@ -2731,7 +2825,7 @@ class BoardController(private val baseCtx: Context) {
             cell.box.removeAllViews()
             for (ev in evs.take(3)) {
                 cell.box.addView(TextView(ctx).apply {
-                    text = ev.title
+                    text = mealTitle(ev)
                     textSize = 10.5f
                     setTextColor(ev.textColor)
                     typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
@@ -2749,6 +2843,7 @@ class BoardController(private val baseCtx: Context) {
     private fun renderAll() {
         updateClock()
         renderWeather()
+        renderDinner()
         renderToday()
         renderCalendar()
         renderLegend()
@@ -2795,6 +2890,7 @@ class BoardController(private val baseCtx: Context) {
                     2 -> listsTab.render()
                     3 -> mealsTab.render()
                     4 -> routinesTab.render()
+                    5 -> groceryTab.render()
                 }
             }
         }
@@ -2936,11 +3032,11 @@ class BoardController(private val baseCtx: Context) {
         box.addView(View(ctx).apply { background = rounded(ev.color, 2) },
             LinearLayout.LayoutParams(dp(4), dp(26)).apply { leftMargin = dp(4); rightMargin = dp(10) })
         box.addView(TextView(ctx).apply {
-            text = when {
+            text = mealWhen(ev, when {
                 ev.allDay -> "All day"
                 ev.start < dayStart -> "…cont."
                 else -> timeFormat().format(ev.start)
-            }
+            })
             textSize = 13f; setTextColor(MUTED); minWidth = dp(70)
         })
         box.addView(TextView(ctx).apply {
@@ -2990,9 +3086,9 @@ class BoardController(private val baseCtx: Context) {
                 ellipsize = TextUtils.TruncateAt.END
             })
             textCol.addView(TextView(ctx).apply {
-                text = if (ev.allDay) "All day"
+                text = mealWhen(ev, if (ev.allDay) "All day"
                        else if (ev.start < dayStart) "until " + timeFormat().format(ev.end)
-                       else timeFormat().format(ev.start)
+                       else timeFormat().format(ev.start))
                 textSize = 12f
                 setTextColor(MUTED)
             })
@@ -3001,9 +3097,105 @@ class BoardController(private val baseCtx: Context) {
         }
     }
 
+    private fun renderDinner() {
+        if (!::dinnerCard.isInitialized) return
+        val now = System.currentTimeMillis()
+        val zone = java.time.ZoneId.systemDefault()
+        val meals = events.filter { it.meal }
+        val pick = KitchenAdapter.pickDinner(
+            meals.map { KitchenAdapter.MealCandidate(it.start, it.end, it.allDay, it.title, it.url, it.dinner) },
+            now, zone)
+        if (pick == null) {
+            dinnerCard.visibility = View.GONE
+            return
+        }
+        dinnerCard.visibility = View.VISIBLE
+        dinnerTitle.text = pick.title
+        val whenLabel = if (pick.allDay) "All day" else timeFormat().format(pick.start)
+        val cook = pick.url
+        dinnerMeta.text = if (!cook.isNullOrEmpty()) "$whenLabel · Tap to cook" else whenLabel
+        dinnerCard.setOnClickListener {
+            if (!cook.isNullOrEmpty()) openCook(cook)
+            else meals.firstOrNull { it.start == pick.start && it.title == pick.title }?.let { showDetails(it) }
+        }
+    }
+
+    private fun openCook(url: String) {
+        val clean = url.trim()
+        if (!clean.startsWith("https://") && !clean.startsWith("http://")) return
+        if (!::cookWeb.isInitialized) return
+        cookTitle.text = "Cook now"
+        cookOverlay.visibility = View.VISIBLE
+        cookWeb.loadUrl(clean)
+    }
+
+    private fun buildCookOverlay(): FrameLayout {
+        val scrim = FrameLayout(ctx).apply {
+            setBackgroundColor(SCRIM)
+            visibility = View.GONE
+            setOnClickListener {
+                cookWeb.stopLoading()
+                cookWeb.loadUrl("about:blank")
+                visibility = View.GONE
+            }
+        }
+        val card = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            background = rounded(CARD, 20)
+            elevation = dp(10).toFloat()
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            isClickable = true
+        }
+        val bar = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        cookTitle = TextView(ctx).apply {
+            text = "Cook now"
+            textSize = 20f
+            setTextColor(INK)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        }
+        bar.addView(cookTitle, LinearLayout.LayoutParams(0, WRAP, 1f))
+        bar.addView(TextView(ctx).apply {
+            text = "Close"
+            textSize = 16f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            background = rounded(ACCENT, 20)
+            minimumHeight = dp(56)
+            minimumWidth = dp(96)
+            setPadding(dp(18), dp(8), dp(18), dp(8))
+            setOnClickListener {
+                cookWeb.stopLoading()
+                cookWeb.loadUrl("about:blank")
+                scrim.visibility = View.GONE
+            }
+        })
+        card.addView(bar, lpMatchWrap(bottom = dp(10)))
+        cookWeb = WebView(ctx).apply {
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.useWideViewPort = true
+            settings.loadWithOverviewMode = true
+            settings.allowFileAccess = false
+            settings.allowContentAccess = false
+            webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = false
+            }
+        }
+        card.addView(cookWeb, LinearLayout.LayoutParams(MATCH, 0, 1f))
+        scrim.addView(card, FrameLayout.LayoutParams(MATCH, MATCH).apply {
+            leftMargin = dp(24); rightMargin = dp(24); topMargin = dp(18); bottomMargin = dp(18)
+        })
+        return scrim
+    }
+
     private fun renderLegend() {
         legendList.removeAllViews()
-        for (f in store.feeds().filter { it.kind != "inbox" }) {
+        val shown = ArrayList(store.feeds().filter { it.kind != "inbox" })
+        store.kitchenFeed()?.let { shown.add(it) }
+        for (f in shown) {
             val row = LinearLayout(ctx).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
@@ -3012,7 +3204,7 @@ class BoardController(private val baseCtx: Context) {
             row.addView(View(ctx).apply { background = circle(f.color) },
                 LinearLayout.LayoutParams(dp(11), dp(11)).apply { rightMargin = dp(8) })
             row.addView(TextView(ctx).apply {
-                text = f.name
+                text = if (f.meal) "${KitchenAdapter.MEAL_ICON}  ${f.name}" else f.name
                 textSize = 13f
                 setTextColor(MUTED)
             })
@@ -3032,11 +3224,11 @@ class BoardController(private val baseCtx: Context) {
             setOnClickListener { showDetails(ev) }
         }
         box.addView(TextView(ctx).apply {
-            text = when {
+            text = mealWhen(ev, when {
                 ev.allDay -> "All day"
                 ev.start < dayStart -> "…continues"
                 else -> timeFormat().format(ev.start)
-            }
+            })
             textSize = 11f
             setTextColor(Palette.withAlpha(ev.textColor, 0xD9))
         })
@@ -3052,6 +3244,12 @@ class BoardController(private val baseCtx: Context) {
     }
 
     // ------------------------------------------------------------ helpers
+
+    private fun mealWhen(ev: EventInstance, label: String) =
+        if (ev.meal) "${KitchenAdapter.MEAL_ICON}  $label" else label
+
+    private fun mealTitle(ev: EventInstance) =
+        if (ev.meal) KitchenAdapter.withMealIcon(ev.title) else ev.title
 
     private fun timeFormat(): SimpleDateFormat =
         if (android.text.format.DateFormat.is24HourFormat(ctx))
