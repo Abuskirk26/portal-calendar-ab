@@ -37,6 +37,7 @@ class GroceryTab(private val ctx: Context) {
     private var errorLine: String? = null
     private var lastFetch = 0L
 
+    private lateinit var titleText: TextView
     private lateinit var statusText: TextView
     private lateinit var errorText: TextView
     private lateinit var listBox: LinearLayout
@@ -54,8 +55,14 @@ class GroceryTab(private val ctx: Context) {
         val grocery = snap.grocery
         if (grocery != null) KitchenAdapter.reconcilePending(pending, grocery, inflight)
 
-        errorText.text = errorLine ?: ""
-        errorText.visibility = if (errorLine.isNullOrEmpty()) View.GONE else View.VISIBLE
+        val auth = snap.authFailed
+        errorText.text = when {
+            auth -> "Reconnect the hub token in Settings. Families Kitchen didn't accept it."
+            errorLine != null -> errorLine
+            else -> ""
+        }
+        errorText.visibility = if (errorText.text.isNullOrEmpty()) View.GONE else View.VISIBLE
+        titleText.text = snap.grocery?.list?.name?.takeIf { it.isNotBlank() } ?: "Grocery"
         statusText.text = statusLine(snap)
         statusText.setTextColor(if (snap.offline && grocery != null) MUTED else FAINT)
 
@@ -72,7 +79,10 @@ class GroceryTab(private val ctx: Context) {
             return
         }
         if (grocery.groups.isEmpty() || grocery.groups.all { it.items.isEmpty() }) {
-            listBox.addView(message("The shopping list is empty."))
+            listBox.addView(message(
+                if (grocery.list == null)
+                    "No shopping list right now. When Families Kitchen has an active list, it shows up here."
+                else "The shopping list is empty."))
             return
         }
         var first = true
@@ -174,6 +184,8 @@ class GroceryTab(private val ctx: Context) {
 
     private fun onToggle(item: KitchenAdapter.Item) {
         if (item.id in inflight || stopped) return
+        val snap = KitchenHub.snapshot(ctx)
+        if (snap.authFailed || System.currentTimeMillis() < snap.rateLimitedUntil) return
         val shown = KitchenAdapter.shownChecked(item.checked, pending[item.id])
         val next = !shown
         pending[item.id] = next
@@ -195,6 +207,15 @@ class GroceryTab(private val ctx: Context) {
                         pending.remove(item.id)
                         errorLine = "Couldn't update ${item.name} — change undone"
                     }
+                    // The hub says this item is gone. Drop the row and reload.
+                    KitchenAdapter.CheckResult.GONE -> {
+                        pending.remove(item.id)
+                        refresh()
+                    }
+                    // 60/min. Keep the tick we showed and wait. Don't undo it and
+                    // don't fire the POST again.
+                    KitchenAdapter.CheckResult.RATE_LIMITED -> pending[item.id] = next
+                    KitchenAdapter.CheckResult.UNAUTHORIZED -> pending.remove(item.id)
                 }
                 render()
             }
@@ -203,6 +224,8 @@ class GroceryTab(private val ctx: Context) {
 
     private fun statusLine(snap: KitchenHub.Snapshot): String {
         if (!snap.configured) return ""
+        if (snap.authFailed) return ""
+        if (System.currentTimeMillis() < snap.rateLimitedUntil) return "Too many updates — waiting a minute"
         val whenText = if (snap.fetchedAt > 0) timeFormat().format(Date(snap.fetchedAt)) else ""
         return when {
             snap.grocery == null && snap.offline -> "Offline"
@@ -228,12 +251,13 @@ class GroceryTab(private val ctx: Context) {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        header.addView(TextView(ctx).apply {
+        titleText = TextView(ctx).apply {
             text = "Grocery"
             textSize = 27f
             setTextColor(INK)
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        header.addView(titleText, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         statusText = TextView(ctx).apply {
             textSize = 14f
             setTextColor(FAINT)

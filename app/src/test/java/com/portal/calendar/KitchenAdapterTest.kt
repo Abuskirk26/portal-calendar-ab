@@ -30,19 +30,32 @@ class KitchenAdapterTest {
 
     @Test fun canonicalGroceryShape() {
         val g = KitchenAdapter.parseGrocery(fixture("grocery.json"))
-        assertEquals("2026-11-14T18:00:00Z", g.updatedAt)
-        assertEquals(listOf("Produce", "Dairy"), g.groups.map { it.name })
-        val spinach = g.groups[0].items[0]
-        assertEquals("kale", spinach.id)
-        assertEquals("Baby spinach", spinach.name)
-        assertEquals("1", spinach.quantity)
-        assertEquals("bag", spinach.unit)
-        assertFalse(spinach.checked)
+        assertEquals("list_1", g.list!!.id)
+        assertEquals("This week", g.list!!.name)
+        assertEquals("2026-11-14T22:30:00.000Z", g.updatedAt)
+        assertEquals(listOf("produce"), g.groups.map { it.name })
+        val onion = g.groups[0].items[0]
+        assertEquals("item_1", onion.id)
+        assertEquals("Onion", onion.name)
+        assertEquals("2", onion.quantity)
+        assertEquals("lb", onion.unit)
+        assertFalse(onion.checked)
+        assertEquals("2026-11-14T22:05:00.000Z", onion.updatedAt)
         assertTrue(g.groups[0].items[1].checked)
+        assertNull(g.groups[0].items[1].quantity)
         assertNull(g.groups[0].items[1].unit)
-        assertEquals("1", g.groups[1].items[0].quantity) // 1.0
-        assertEquals("1 bag", KitchenAdapter.quantityLabel(spinach))
-        assertEquals("2", KitchenAdapter.quantityLabel(g.groups[0].items[1])) // quantity, no unit
+        assertEquals("2 lb", KitchenAdapter.quantityLabel(onion))
+    }
+
+    @Test fun inactiveListIsAnEmptyDocument() {
+        val g = KitchenAdapter.parseGrocery(fixture("grocery-empty.json"))
+        assertNull(g.list)
+        assertTrue(g.groups.isEmpty())
+        val item = KitchenAdapter.parseCheckedItem(
+            """{"item":{"id":"item_1","name":"Onion","quantity":2,"unit":"lb","checked":true,"updatedAt":"2026-11-14T22:10:00.000Z"}}""")
+        assertEquals("item_1", item.id)
+        assertTrue(item.checked)
+        assertEquals("2", item.quantity)
     }
 
     @Test fun oddShapesAreTolerated() {
@@ -94,11 +107,12 @@ class KitchenAdapterTest {
             "https://families-kitchen.example/api/hub/meals.ics?token=hub%20token",
             KitchenAdapter.mealsUrl("families-kitchen.example", " hub token "))
         assertEquals(
-            "https://families-kitchen.example/api/hub/grocery.json?token=hub%20token",
-            KitchenAdapter.groceryUrl("https://families-kitchen.example/", "hub token"))
+            "https://families-kitchen.example/api/hub/grocery.json",
+            KitchenAdapter.groceryUrl("https://families-kitchen.example/"))
         assertEquals(
-            "https://families-kitchen.example/api/hub/grocery/a%2Fb%20c/check?token=hub%20token",
-            KitchenAdapter.checkUrl("https://families-kitchen.example", "hub token", "a/b c"))
+            "https://families-kitchen.example/api/hub/grocery/a%2Fb%20c/check",
+            KitchenAdapter.checkUrl("https://families-kitchen.example", "a/b c"))
+        assertFalse(KitchenAdapter.groceryUrl("https://families-kitchen.example").contains("token"))
         assertEquals("{\"checked\":true}", KitchenAdapter.checkBody(true))
         assertEquals("{\"checked\":false}", KitchenAdapter.checkBody(false))
         try {
@@ -111,13 +125,16 @@ class KitchenAdapterTest {
 
     @Test fun cookUrlFromPropertyOrDescription() {
         val events = Biweekly.parse(fixture("meals.ics")).all().first().events
-        val pasta = events[0]
-        val salad = events[1]
+        assertEquals("meal-eggs@families.kitchen", events[0].uid.value)
+        assertTrue(events.any { it.uid.value == "meal-pasta@families.kitchen" })
+        val pasta = events.first { it.uid.value == "meal-pasta@families.kitchen" }
+        val salad = events.first { it.uid.value == "meal-salad@families.kitchen" }
+        assertTrue(pasta.summary.value.startsWith("🍽"))
         assertEquals(
-            "https://families-kitchen.example/cook/pasta",
+            "https://families-kitchen.example/recipes/pasta/cook",
             KitchenAdapter.cookUrl(pasta.url?.value, pasta.description?.value))
         assertEquals(
-            "https://families-kitchen.example/cook/salad",
+            "https://families-kitchen.example/recipes/salad/cook",
             KitchenAdapter.cookUrl(salad.url?.value, salad.description?.value))
         assertNull(KitchenAdapter.cookUrl("javascript:alert(1)", "see notes"))
         assertEquals("🍲 Pasta", KitchenAdapter.withMealIcon("🍲 Pasta"))
@@ -132,6 +149,16 @@ class KitchenAdapterTest {
         assertEquals("🍲 Pasta primavera", pick!!.title)
         assertEquals("https://example.test/pasta", pick.url)
         assertNull(KitchenAdapter.pickDinner(listOf(lunch), now, zone))
+    }
+
+    @Test fun dinnerPlateBeatsASnackNearSix() {
+        val now = at(16)
+        val snack = meal(17, "🍎 Apple slices")
+        val dinner = meal(19, "🍽️ Pasta primavera", url = "https://families-kitchen.example/recipes/pasta/cook")
+        val pick = KitchenAdapter.pickDinner(listOf(snack, dinner, meal(8, "🍳 Eggs"), meal(12, "🥗 Chicken salad")), now, zone)
+        assertEquals("🍽️ Pasta primavera", pick!!.title)
+        assertTrue(KitchenAdapter.looksLikeDinner(pick.title))
+        assertFalse(KitchenAdapter.looksLikeDinner(snack.title))
     }
 
     @Test fun pickDinnerUsesALabeledOrSoloAllDayMeal() {
@@ -167,17 +194,20 @@ class KitchenAdapterTest {
 
         val server = KitchenAdapter.parseGrocery(fixture("grocery.json"))
         val pending = HashMap<String, Boolean>()
-        pending["milk"] = true
-        pending["kale"] = false // already matches the server
+        pending["item_1"] = true
+        pending["item_2"] = true // already matches the server
         pending["gone"] = true
         KitchenAdapter.reconcilePending(pending, server)
-        assertEquals(setOf("milk"), pending.keys)
-        pending["kale"] = false
-        KitchenAdapter.reconcilePending(pending, server, inflight = setOf("kale"))
-        assertTrue(pending.containsKey("kale")) // still posting — don't drop it
-        val flipped = KitchenAdapter.withChecked(server, "milk", true)
-        assertTrue(flipped.groups[1].items[0].checked)
-        assertFalse(server.groups[1].items[0].checked)
+        assertEquals(setOf("item_1"), pending.keys)
+        pending["item_2"] = true
+        KitchenAdapter.reconcilePending(pending, server, inflight = setOf("item_2"))
+        assertTrue(pending.containsKey("item_2")) // still posting — don't drop it
+        val flipped = KitchenAdapter.withChecked(server, "item_1", true)
+        assertTrue(flipped.groups[0].items[0].checked)
+        assertFalse(server.groups[0].items[0].checked)
+        val replaced = KitchenAdapter.withItem(server, server.groups[0].items[0].copy(checked = true))
+        assertTrue(replaced.groups[0].items[0].checked)
+        assertEquals(listOf("item_2"), KitchenAdapter.withoutItem(server, "item_1").groups[0].items.map { it.id })
     }
 
     @Test fun fetchIsDroppedWhenACheckOrHubChangeLandedFirst() {

@@ -5,6 +5,7 @@ import com.sun.net.httpserver.HttpServer
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
@@ -14,11 +15,18 @@ import java.net.InetSocketAddress
 import java.util.Collections
 
 /**
- * Families Kitchen hub against an in-process server: meals feed, grocery list,
- * and the check POST (including a failure the board rolls back from). No network.
+ * Families Kitchen hub against an in-process server. Grocery calls use
+ * Authorization: Bearer. The meals feed keeps ?token=. 401, 404, and 429 are
+ * distinct from a generic failure.
  */
 class KitchenClientHttpTest {
-    private class Seen(val method: String, val rawPath: String, val rawQuery: String, val body: String)
+    private class Seen(
+        val method: String,
+        val rawPath: String,
+        val rawQuery: String,
+        val body: String,
+        val auth: String
+    )
 
     private lateinit var http: HttpServer
     private val seen: MutableList<Seen> = Collections.synchronizedList(ArrayList())
@@ -46,83 +54,112 @@ class KitchenClientHttpTest {
         return null
     }
 
+    private fun bearer(ex: HttpExchange): String {
+        val header = ex.requestHeaders.getFirst("Authorization") ?: return ""
+        return if (header.startsWith("Bearer ")) header.removePrefix("Bearer ") else ""
+    }
+
     @Before fun startServer() {
-        checked["milk"] = false
-        checked["kale"] = true
+        checked["item_1"] = false
         http = HttpServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0)
         http.createContext("/") { ex ->
             val body = ex.requestBody.readBytes().toString(Charsets.UTF_8)
             val path = ex.requestURI.rawPath ?: ""
             val query = ex.requestURI.rawQuery ?: ""
-            seen.add(Seen(ex.requestMethod, path, query, body))
-            val tok = queryToken(ex.requestURI.rawQuery)
+            val auth = bearer(ex)
+            seen.add(Seen(ex.requestMethod, path, query, body, auth))
             when {
                 path == "/api/hub/redirect" -> {
                     ex.responseHeaders.add("Location", "http://127.0.0.1:${http.address.port}/stolen")
                     ex.reply(302)
                 }
                 path == "/stolen" -> ex.reply(200, "should-not-be-fetched", "text/plain")
-                tok != token -> ex.reply(401, "{\"error\":\"no\"}")
                 path == "/api/hub/meals.ics" && ex.requestMethod == "GET" ->
-                    ex.reply(200, fixture("meals.ics"), "text/calendar")
-                path == "/api/hub/grocery.json" && ex.requestMethod == "GET" -> ex.reply(200, groceryJson())
-                path.startsWith("/api/hub/grocery/") && path.endsWith("/check") && ex.requestMethod == "POST" -> {
-                    val id = java.net.URLDecoder.decode(
-                        path.removePrefix("/api/hub/grocery/").removeSuffix("/check"), "UTF-8")
-                    if (id == "boom") {
-                        ex.reply(500, "{\"error\":\"nope\"}")
-                    } else {
-                        checked[id] = body.contains("\"checked\":true")
-                        ex.reply(200, "{\"ok\":true}")
-                    }
-                }
-                else -> ex.reply(404)
+                    if (queryToken(query) != token) ex.reply(401, "{\"message\":\"Invalid hub token\"}")
+                    else ex.reply(200, fixture("meals.ics"), "text/calendar")
+                path == "/api/hub/grocery.json" && ex.requestMethod == "GET" ->
+                    if (auth != token) ex.reply(401, "{\"message\":\"Invalid hub token\"}")
+                    else ex.reply(200, groceryJson())
+                path.startsWith("/api/hub/grocery/") && path.endsWith("/check") && ex.requestMethod == "POST" ->
+                    answerCheck(ex, path, body, auth)
+                else -> ex.reply(404, "{\"message\":\"no\"}")
             }
         }
         http.start()
     }
 
+    private fun answerCheck(ex: HttpExchange, path: String, body: String, auth: String) {
+        if (auth != token) {
+            ex.reply(401, "{\"message\":\"Hub token has been revoked\"}")
+            return
+        }
+        val id = java.net.URLDecoder.decode(
+            path.removePrefix("/api/hub/grocery/").removeSuffix("/check"), "UTF-8")
+        when (id) {
+            "gone" -> ex.reply(404, "{\"message\":\"Shopping item not found\"}")
+            "slow" -> ex.reply(429, "{\"message\":\"Too many hub requests. Try again shortly.\"}")
+            "boom" -> ex.reply(500, "{\"message\":\"nope\"}")
+            else -> {
+                val want = body.contains("\"checked\":true")
+                checked[id] = want
+                ex.reply(200, """{"item":{"id":${quote(id)},"name":"Onion","quantity":2,"unit":"lb","checked":$want,"updatedAt":"2026-11-14T22:10:00.000Z"}}""")
+            }
+        }
+    }
+
+    private fun quote(s: String) = "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
     @After fun stopServer() = http.stop(0)
 
     private fun groceryJson(): String {
-        val milk = checked["milk"] == true
-        val kale = checked["kale"] == true
-        return """{"updatedAt":"2026-11-14T18:00:00Z","groups":[
-            {"name":"Produce","items":[{"id":"kale","name":"Baby spinach","quantity":1,"unit":"bag","checked":$kale}]},
-            {"name":"Dairy","items":[{"id":"milk","name":"Whole milk","quantity":1,"unit":"gal","checked":$milk}]}
+        val onion = checked["item_1"] == true
+        return """{"list":{"id":"list_1","name":"This week","updatedAt":"2026-11-14T22:30:00.000Z"},"groups":[
+            {"aisle":"produce","items":[{"id":"item_1","name":"Onion","quantity":2,"unit":"lb","checked":$onion,"updatedAt":"2026-11-14T22:05:00.000Z"}]}
         ]}"""
     }
 
-    @Test fun mealsFeedAndGroceryRoundTripThroughTheToken() {
+    @Test fun mealsUseTheQueryTokenAndGroceryUsesBearer() {
         val ics = KitchenClient.fetchMealsIcs(base, token)
         assertTrue(ics.contains("BEGIN:VCALENDAR"))
-        assertTrue(ics.contains("Pasta primavera"))
-        val list = KitchenClient.fetchGrocery(base, token)
-        assertEquals("Dairy", list.groups[1].name)
-        assertFalse(list.groups[1].items[0].checked)
+        assertTrue(ics.contains("meal-pasta@families.kitchen"))
         assertEquals(token, queryToken(seen[0].rawQuery))
-        assertTrue(seen[0].rawQuery.contains("token=hub%20token"))
+        assertEquals("", seen[0].auth)
+
+        val list = KitchenClient.fetchGrocery(base, token)
+        assertEquals(KitchenClient.Status.OK, list.status)
+        assertEquals("produce", list.value!!.groups[0].name)
+        assertEquals("This week", list.value!!.list!!.name)
+        assertFalse(list.value!!.groups[0].items[0].checked)
+        val get = seen.last { it.rawPath == "/api/hub/grocery.json" }
+        assertEquals("Bearer hub token", "Bearer " + get.auth)
+        assertFalse(get.rawQuery.contains("token"))
     }
 
-    @Test fun checkPostsThenAFailedCheckLeavesTheServerUnchanged() {
-        assertTrue(KitchenClient.setChecked(base, token, "milk", true))
+    @Test fun checkReturnsTheItemAndSpecialStatusesStayDistinct() {
+        val ok = KitchenClient.setChecked(base, token, "item_1", true)
+        assertEquals(KitchenClient.Status.OK, ok.status)
+        assertTrue(ok.value!!.checked)
+        assertEquals("item_1", ok.value!!.id)
         val post = seen.last { it.method == "POST" }
-        assertEquals("/api/hub/grocery/milk/check", post.rawPath)
+        assertEquals("/api/hub/grocery/item_1/check", post.rawPath)
         assertEquals("{\"checked\":true}", post.body)
-        assertEquals(token, queryToken(post.rawQuery))
-        assertTrue(KitchenClient.fetchGrocery(base, token).groups[1].items[0].checked)
+        assertEquals(token, post.auth)
+        assertFalse(post.rawQuery.contains("token"))
+        assertTrue(KitchenClient.fetchGrocery(base, token).value!!.groups[0].items[0].checked)
 
-        val before = checked["boom"]
-        assertFalse(KitchenClient.setChecked(base, token, "boom", true))
-        assertEquals(before, checked["boom"]) // server did not store it
-        // The board drops the optimistic override when the POST fails.
-        assertNullRollback()
-        // milk is still checked — the failed id didn't undo a different item
-        assertTrue(KitchenClient.fetchGrocery(base, token).groups[1].items[0].checked)
+        assertEquals(KitchenClient.Status.NOT_FOUND, KitchenClient.setChecked(base, token, "gone", true).status)
+        assertEquals(KitchenClient.Status.RATE_LIMITED, KitchenClient.setChecked(base, token, "slow", true).status)
+        assertEquals(KitchenClient.Status.FAILED, KitchenClient.setChecked(base, token, "boom", true).status)
+        assertEquals(KitchenClient.Status.UNAUTHORIZED, KitchenClient.setChecked(base, "nope", "item_1", false).status)
+        // The failed and rejected checks did not flip the item back.
+        assertTrue(checked["item_1"] == true)
+        assertNull(checked["gone"])
+        assertNull(checked["slow"])
     }
 
     @Test fun slashyIdsAreEncodedAndRedirectsAreNotFollowed() {
-        assertTrue(KitchenClient.setChecked(base, token, "ice cream/2", true))
+        val ok = KitchenClient.setChecked(base, token, "ice cream/2", true)
+        assertEquals(KitchenClient.Status.OK, ok.status)
         val post = seen.last { it.method == "POST" }
         assertTrue(post.rawPath.contains("ice%20cream%2F2") || post.rawPath.contains("ice%20cream%2f2"))
         assertEquals(true, checked["ice cream/2"])
@@ -139,16 +176,8 @@ class KitchenClientHttpTest {
     }
 
     @Test fun failuresDoNotEchoTheToken() {
-        try {
-            KitchenClient.fetchGrocery("http://127.0.0.1:1", "super-secret-token")
-            fail("connection to a closed port succeeded")
-        } catch (e: Exception) {
-            assertFalse(e.message!!.contains("super-secret-token"))
-            assertFalse(e.message!!.contains("127.0.0.1"))
-        }
-    }
-
-    private fun assertNullRollback() {
-        assertEquals(null, KitchenAdapter.pendingAfterPost(true, false))
+        val out = KitchenClient.fetchGrocery("http://127.0.0.1:1", "super-secret-token")
+        assertEquals(KitchenClient.Status.FAILED, out.status)
+        assertNull(out.value)
     }
 }

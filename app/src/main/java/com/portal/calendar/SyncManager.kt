@@ -182,7 +182,7 @@ class SyncManager(private val ctx: Context, private val store: ConfigStore) {
                 val title = e.summary?.value?.trim().takeUnless { it.isNullOrEmpty() } ?: "(untitled)"
                 val loc = e.location?.value?.trim().takeUnless { it.isNullOrEmpty() }
                 val cook = if (feed.meal) KitchenAdapter.cookUrl(e.url?.value, e.description?.value) else null
-                val dinnerHint = feed.meal && (title.contains("dinner", ignoreCase = true) ||
+                val dinnerHint = feed.meal && (KitchenAdapter.looksLikeDinner(title) ||
                     categoriesText(e).contains("dinner", ignoreCase = true))
                 fun emit(startMs: Long, recurringFlag: Boolean) {
                     if (startMs + durMs >= windowStart && startMs <= windowEnd)

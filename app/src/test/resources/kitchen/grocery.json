@@ -1,19 +1,30 @@
 {
-  "updatedAt": "2026-11-14T18:00:00Z",
+  "list": {
+    "id": "list_1",
+    "name": "This week",
+    "updatedAt": "2026-11-14T22:30:00.000Z"
+  },
   "groups": [
     {
-      "name": "Produce",
+      "aisle": "produce",
       "items": [
-        {"id": "kale", "name": "Baby spinach", "quantity": 1, "unit": "bag", "checked": false, "updatedAt": "2026-11-14T17:00:00Z"},
-        {"id": "lemons", "name": "Lemons", "quantity": 2, "unit": null, "checked": true, "updatedAt": "2026-11-14T17:05:00Z", "note": "ignored"}
-      ]
-    },
-    {
-      "name": "Dairy",
-      "items": [
-        {"id": "milk", "name": "Whole milk", "quantity": 1.0, "unit": "gal", "checked": false}
+        {
+          "id": "item_1",
+          "name": "Onion",
+          "quantity": 2,
+          "unit": "lb",
+          "checked": false,
+          "updatedAt": "2026-11-14T22:05:00.000Z"
+        },
+        {
+          "id": "item_2",
+          "name": "Lemon",
+          "quantity": null,
+          "unit": null,
+          "checked": true,
+          "updatedAt": "2026-11-14T22:06:00.000Z"
+        }
       ]
     }
-  ],
-  "extra": true
+  ]
 }

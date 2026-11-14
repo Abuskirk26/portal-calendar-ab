@@ -17,7 +17,11 @@ object KitchenHub {
         val configured: Boolean,
         val grocery: KitchenAdapter.Grocery?,
         val fetchedAt: Long,
-        val offline: Boolean
+        val offline: Boolean,
+        /** The hub rejected the token. The board should ask to reconnect it. */
+        val authFailed: Boolean = false,
+        /** Don't call the hub again until this time. A 429 is 60 requests per minute. */
+        val rateLimitedUntil: Long = 0L
     )
 
     private val lock = Any()
@@ -28,13 +32,22 @@ object KitchenHub {
     private var boundKey: String? = null
     /** Bumps on every successful check so an older GET cannot overwrite it. */
     private var epoch: Long = 0
+    private var authFailed: Boolean = false
+    private var rateLimitedUntil: Long = 0L
 
     fun snapshot(ctx: Context): Snapshot {
         val live = liveKey(ctx)
         synchronized(lock) {
             // Hide a list that belongs to a hub we are no longer pointed at.
             val show = live != null && boundKey == live
-            return Snapshot(live != null, if (show) memory else null, if (show) fetchedAt else 0L, show && offline)
+            return Snapshot(
+                live != null,
+                if (show) memory else null,
+                if (show) fetchedAt else 0L,
+                show && offline,
+                show && authFailed,
+                if (show) rateLimitedUntil else 0L
+            )
         }
     }
 
@@ -69,32 +82,37 @@ object KitchenHub {
         }
         // Don't rebind here. A newer hub change must not be overwritten by this
         // call assigning boundKey back to the hub it started with.
-        val started = synchronized(lock) { epoch }
-        try {
-            // Use the URL and token captured above. Re-reading the store here would
-            // fetch the new hub and then file that list under the old hub's key.
-            val grocery = KitchenClient.fetchGrocery(captured.base, captured.token)
-            val now = System.currentTimeMillis()
-            synchronized(lock) {
-                if (!applyAllowed(ctx, started, captured.key)) return@synchronized
-                memory = grocery
-                fetchedAt = now
-                offline = false
-                boundKey = captured.key
-                writeCache(ctx, grocery, now, captured.key)
-            }
-        } catch (e: Exception) {
-            synchronized(lock) {
-                if (!applyAllowed(ctx, started, captured.key)) return@synchronized
-                if (memory == null) {
-                    val cached = readCache(ctx, captured.key)
-                    if (cached != null) {
-                        memory = cached.first
-                        fetchedAt = cached.second
-                    }
+        val started = synchronized(lock) {
+            if (System.currentTimeMillis() < rateLimitedUntil) return snapshot(ctx)
+            epoch
+        }
+        val call = KitchenClient.fetchGrocery(captured.base, captured.token)
+        val now = System.currentTimeMillis()
+        synchronized(lock) {
+            if (!applyAllowed(ctx, started, captured.key)) return@synchronized
+            when (call.status) {
+                KitchenClient.Status.OK -> {
+                    val grocery = call.value ?: return@synchronized
+                    memory = grocery
+                    fetchedAt = now
+                    offline = false
+                    authFailed = false
+                    boundKey = captured.key
+                    writeCache(ctx, grocery, now, captured.key)
                 }
-                offline = true
-                boundKey = captured.key
+                KitchenClient.Status.UNAUTHORIZED -> authFailed = true
+                KitchenClient.Status.RATE_LIMITED -> rateLimitedUntil = now + RATE_LIMIT_MS
+                else -> {
+                    if (memory == null) {
+                        val cached = readCache(ctx, captured.key)
+                        if (cached != null) {
+                            memory = cached.first
+                            fetchedAt = cached.second
+                        }
+                    }
+                    offline = true
+                    boundKey = captured.key
+                }
             }
         }
         return snapshot(ctx)
@@ -109,17 +127,42 @@ object KitchenHub {
      */
     fun setChecked(ctx: Context, id: String, checked: Boolean): KitchenAdapter.CheckResult {
         val captured = capture(ctx) ?: return KitchenAdapter.CheckResult.FAILED
-        val ok = KitchenClient.setChecked(captured.base, captured.token, id, checked)
+        if (System.currentTimeMillis() < rateLimitedUntil) return KitchenAdapter.CheckResult.RATE_LIMITED
+        val call = KitchenClient.setChecked(captured.base, captured.token, id, checked)
         synchronized(lock) {
-            val outcome = KitchenAdapter.checkOutcome(ok, captured.key, liveKey(ctx))
-            if (outcome != KitchenAdapter.CheckResult.APPLIED) return outcome
-            epoch++
-            boundKey = captured.key
-            val current = memory ?: return KitchenAdapter.CheckResult.APPLIED
-            val next = KitchenAdapter.withChecked(current, id, checked)
-            memory = next
-            writeCache(ctx, next, fetchedAt, captured.key)
-            return KitchenAdapter.CheckResult.APPLIED
+            when (call.status) {
+                KitchenClient.Status.UNAUTHORIZED -> {
+                    authFailed = true
+                    return KitchenAdapter.CheckResult.UNAUTHORIZED
+                }
+                KitchenClient.Status.RATE_LIMITED -> {
+                    rateLimitedUntil = System.currentTimeMillis() + RATE_LIMIT_MS
+                    return KitchenAdapter.CheckResult.RATE_LIMITED
+                }
+                KitchenClient.Status.NOT_FOUND -> {
+                    if (boundKey == captured.key || boundKey == null) {
+                        memory?.let {
+                            memory = KitchenAdapter.withoutItem(it, id)
+                            writeCache(ctx, memory!!, fetchedAt, captured.key)
+                        }
+                    }
+                    return KitchenAdapter.CheckResult.GONE
+                }
+                KitchenClient.Status.OK -> {
+                    val item = call.value ?: return KitchenAdapter.CheckResult.FAILED
+                    val outcome = KitchenAdapter.checkOutcome(true, captured.key, liveKey(ctx))
+                    if (outcome != KitchenAdapter.CheckResult.APPLIED) return outcome
+                    epoch++
+                    authFailed = false
+                    boundKey = captured.key
+                    val current = memory ?: return KitchenAdapter.CheckResult.APPLIED
+                    val next = KitchenAdapter.withItem(current, item)
+                    memory = next
+                    writeCache(ctx, next, fetchedAt, captured.key)
+                    return KitchenAdapter.CheckResult.APPLIED
+                }
+                else -> return KitchenAdapter.CheckResult.FAILED
+            }
         }
     }
 
@@ -158,6 +201,8 @@ object KitchenHub {
             memory = null
             fetchedAt = 0
             offline = false
+            authFailed = false
+            rateLimitedUntil = 0L
             boundKey = null
         }
         runCatching {
@@ -199,6 +244,7 @@ object KitchenHub {
         return grocery to at
     }
 
+    private const val RATE_LIMIT_MS = 60_000L
     private const val CACHE = "kitchen_grocery.json"
     private const val CACHE_AT = "kitchen_grocery_at.txt"
     private const val CACHE_KEY = "kitchen_grocery_key.txt"

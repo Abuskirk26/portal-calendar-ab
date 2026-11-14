@@ -1,18 +1,42 @@
 BEGIN:VCALENDAR
 VERSION:2.0
-PRODID:-//Families Kitchen//Hub//EN
+PRODID:-//Families Kitchen//Wall Hub//EN
+CALSCALE:GREGORIAN
+METHOD:PUBLISH
 BEGIN:VEVENT
-UID:dinner-pasta
-DTSTART:20261114T180000
-DTEND:20261114T190000
-SUMMARY:🍲 Pasta primavera
-URL:https://families-kitchen.example/cook/pasta
+UID:meal-eggs@families.kitchen
+DTSTAMP:20261114T180000Z
+DTSTART:20261114T150000Z
+DTEND:20261114T154500Z
+SUMMARY:🍳 Eggs
+DESCRIPTION:Breakfast\nCook Now: https://families-kitchen.example/recipes/eggs/cook
+URL:https://families-kitchen.example/recipes/eggs/cook
 END:VEVENT
 BEGIN:VEVENT
-UID:lunch-salad
-DTSTART:20261114T120000
-DTEND:20261114T123000
-SUMMARY:Chicken salad
-DESCRIPTION:Cook now https://families-kitchen.example/cook/salad.
+UID:meal-salad@families.kitchen
+DTSTAMP:20261114T180000Z
+DTSTART:20261114T190000Z
+DTEND:20261114T194500Z
+SUMMARY:🥗 Chicken salad
+DESCRIPTION:Lunch\nCook Now: https://families-kitchen.example/recipes/salad/cook
+URL:https://families-kitchen.example/recipes/salad/cook
+END:VEVENT
+BEGIN:VEVENT
+UID:meal-apple@families.kitchen
+DTSTAMP:20261114T180000Z
+DTSTART:20261114T223000Z
+DTEND:20261114T230000Z
+SUMMARY:🍎 Apple slices
+DESCRIPTION:Snack\nCook Now: https://families-kitchen.example/recipes/apple/cook
+URL:https://families-kitchen.example/recipes/apple/cook
+END:VEVENT
+BEGIN:VEVENT
+UID:meal-pasta@families.kitchen
+DTSTAMP:20261114T180000Z
+DTSTART:20261115T003000Z
+DTEND:20261115T013000Z
+SUMMARY:🍽️ Pasta primavera
+DESCRIPTION:Dinner\nCook Now: https://families-kitchen.example/recipes/pasta/cook
+URL:https://families-kitchen.example/recipes/pasta/cook
 END:VEVENT
 END:VCALENDAR

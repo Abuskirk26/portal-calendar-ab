@@ -14,9 +14,12 @@ import kotlin.math.abs
  * touching the board. This file is the only place that knows the payload
  * shape, the URL layout, and which meal is "tonight's dinner".
  *
- * Assumed grocery document (extra fields ignored, several key aliases accepted):
- * {"updatedAt":"...","groups":[{"name":"Produce","items":[
- *   {"id":"..","name":"..","quantity":2,"unit":"lb","checked":false,"updatedAt":".."}]}]}
+ * Primary grocery document (GET /api/hub/grocery.json). Extra fields and a few
+ * older key names (`name` for an aisle, `qty`, `done`) are still accepted:
+ * {"list": null | {"id","name","updatedAt"}, "groups":[{"aisle":"...","items":[
+ *   {"id","name","quantity":2|null,"unit":null,"checked":false,"updatedAt":"..."}]}]}
+ * When nothing is active, `list` is null and `groups` is [].
+ * POST /api/hub/grocery/:id/check returns {"item": <the same item>}.
  *
  * No Android types — unit tests run this on the JVM.
  */
@@ -38,7 +41,14 @@ object KitchenAdapter {
 
     data class Group(val name: String, val items: List<Item>)
 
-    data class Grocery(val updatedAt: String?, val groups: List<Group>)
+    /** The active shopping list, when the hub has one. */
+    data class ListInfo(val id: String, val name: String?, val updatedAt: String?)
+
+    data class Grocery(
+        val updatedAt: String?,
+        val groups: List<Group>,
+        val list: ListInfo? = null
+    )
 
     data class MealCandidate(
         val start: Long,
@@ -78,13 +88,14 @@ object KitchenAdapter {
     fun mealsUrl(base: String, token: String): String =
         normalizeBase(base) + "/api/hub/meals.ics?token=" + enc(requireToken(token))
 
-    fun groceryUrl(base: String, token: String): String =
-        normalizeBase(base) + "/api/hub/grocery.json?token=" + enc(requireToken(token))
+    /** Grocery calls send the token as Authorization: Bearer, not on the query string. */
+    fun groceryUrl(base: String): String =
+        normalizeBase(base) + "/api/hub/grocery.json"
 
-    fun checkUrl(base: String, token: String, id: String): String {
+    fun checkUrl(base: String, id: String): String {
         val clean = id.trim()
         if (clean.isEmpty()) throw IllegalArgumentException("that grocery item has no id")
-        return normalizeBase(base) + "/api/hub/grocery/" + enc(clean) + "/check?token=" + enc(requireToken(token))
+        return normalizeBase(base) + "/api/hub/grocery/" + enc(clean) + "/check"
     }
 
     fun checkBody(checked: Boolean): String =
@@ -181,7 +192,7 @@ object KitchenAdapter {
         startedEpoch == nowEpoch && startedKey == nowKey
 
     /** What the board should do after a check POST. [liveKey] is null when Kitchen was disconnected. */
-    enum class CheckResult { APPLIED, SUPERSEDED, FAILED }
+    enum class CheckResult { APPLIED, SUPERSEDED, FAILED, GONE, RATE_LIMITED, UNAUTHORIZED }
 
     /**
      * The POST is reported as a failure only when the hub rejected it.
@@ -195,6 +206,24 @@ object KitchenAdapter {
         liveKey == null || liveKey != postedKey -> CheckResult.SUPERSEDED
         else -> CheckResult.APPLIED
     }
+
+    /** True when the hub labeled this event dinner (🍽️ or the word). */
+    fun looksLikeDinner(title: String): Boolean {
+        val t = title.trim()
+        if (t.startsWith("\uD83C\uDF7D")) return true // 🍽, including 🍽️
+        return t.contains("dinner", ignoreCase = true)
+    }
+
+    fun withItem(grocery: Grocery, item: Item): Grocery = grocery.copy(
+        groups = grocery.groups.map { g ->
+            g.copy(items = g.items.map { if (it.id == item.id) item else it })
+        }
+    )
+
+    fun withoutItem(grocery: Grocery, id: String): Grocery = grocery.copy(
+        groups = grocery.groups.map { g -> g.copy(items = g.items.filter { it.id != id }) }
+            .filter { it.items.isNotEmpty() }
+    )
 
     fun withChecked(grocery: Grocery, id: String, checked: Boolean): Grocery = grocery.copy(
         groups = grocery.groups.map { g ->
@@ -248,21 +277,41 @@ object KitchenAdapter {
         }
     }
 
+    /** The item object from POST /api/hub/grocery/:id/check. */
+    fun parseCheckedItem(json: String): Item {
+        val text = json.trim().removePrefix("\uFEFF")
+        val root = try {
+            Parser(text).parse()
+        } catch (e: Exception) {
+            throw IllegalArgumentException("grocery check didn't return an item")
+        }
+        if (root !is J.Obj) throw IllegalArgumentException("grocery check didn't return an item")
+        return parseItem(root.map["item"] ?: root)
+            ?: throw IllegalArgumentException("grocery check didn't return an item")
+    }
+
     /** Canonical document, so a cached copy round-trips through [parseGrocery]. */
     fun writeGrocery(g: Grocery): String {
         val sb = StringBuilder(256)
-        sb.append("{\"updatedAt\":")
-        sb.append(if (g.updatedAt == null) "null" else quote(g.updatedAt))
+        sb.append("{\"list\":")
+        val info = g.list
+        if (info == null) sb.append("null") else {
+            sb.append("{\"id\":").append(quote(info.id))
+            sb.append(",\"name\":")
+            sb.append(if (info.name == null) "null" else quote(info.name))
+            sb.append(",\"updatedAt\":")
+            sb.append(if (info.updatedAt == null) "null" else quote(info.updatedAt))
+            sb.append('}')
+        }
         sb.append(",\"groups\":[")
         g.groups.forEachIndexed { gi, group ->
             if (gi > 0) sb.append(',')
-            sb.append("{\"name\":").append(quote(group.name)).append(",\"items\":[")
+            sb.append("{\"aisle\":").append(quote(group.name)).append(",\"items\":[")
             group.items.forEachIndexed { ii, item ->
                 if (ii > 0) sb.append(',')
                 sb.append("{\"id\":").append(quote(item.id))
                 sb.append(",\"name\":").append(quote(item.name))
-                sb.append(",\"quantity\":")
-                sb.append(if (item.quantity == null) "null" else quote(item.quantity))
+                sb.append(",\"quantity\":").append(jsonQuantity(item.quantity))
                 sb.append(",\"unit\":")
                 sb.append(if (item.unit == null) "null" else quote(item.unit))
                 sb.append(",\"checked\":").append(if (item.checked) "true" else "false")
@@ -274,6 +323,15 @@ object KitchenAdapter {
         }
         sb.append("]}")
         return sb.toString()
+    }
+
+    private fun jsonQuantity(quantity: String?): String {
+        if (quantity == null) return "null"
+        val t = quantity.trim()
+        if (t.isEmpty()) return "null"
+        val n = t.toDoubleOrNull()
+        if (n != null && t.none { it.isLetter() }) return t
+        return quote(t)
     }
 
     private fun isHttp(s: String) = s.startsWith("https://") || s.startsWith("http://")
@@ -289,11 +347,19 @@ object KitchenAdapter {
     }
 
     private fun isDinner(c: MealCandidate, zone: ZoneId): Boolean {
-        if (c.dinner || c.title.contains("dinner", ignoreCase = true)) return true
-        if (isOtherMeal(c.title)) return false
+        if (c.dinner || looksLikeDinner(c.title)) return true
+        if (looksLikeOtherSlot(c.title)) return false
         if (c.allDay) return false
         val hour = ZonedDateTime.ofInstant(Instant.ofEpochMilli(c.start), zone).hour
-        return hour in 15..21
+        return hour in 16..21
+    }
+
+    /** Breakfast 🍳, lunch 🥗, and snack 🍎 are not dinner, even at 3:30pm. */
+    private fun looksLikeOtherSlot(title: String): Boolean {
+        val t = title.trim()
+        if (t.startsWith("\uD83C\uDF73") || t.startsWith("\uD83E\uDD57") || t.startsWith("\uD83C\uDF4E"))
+            return true
+        return isOtherMeal(t)
     }
 
     private fun isOtherMeal(title: String): Boolean {
@@ -307,15 +373,20 @@ object KitchenAdapter {
     }
 
     private fun groceryFromObject(o: J.Obj): Grocery {
-        val updated = firstString(o, "updatedAt", "updated_at", "updated")
+        val meta = listInfo(o.map["list"])
+        val updated = meta?.updatedAt ?: firstString(o, "updatedAt", "updated_at", "updated")
         val groupsEl = first(o, "groups", "aisles", "categories", "sections")
-        if (groupsEl is J.Arr) {
-            val groups = groupsFromArray(groupsEl)
-            if (groups.isNotEmpty()) return Grocery(updated, groups)
-        }
+        if (groupsEl is J.Arr) return Grocery(updated, groupsFromArray(groupsEl), meta)
         val itemsEl = first(o, "items", "entries", "lines")
-        if (itemsEl is J.Arr) return Grocery(updated, groupFlatItems(itemsEl))
-        return Grocery(updated, emptyList())
+        if (itemsEl is J.Arr) return Grocery(updated, groupFlatItems(itemsEl), meta)
+        return Grocery(updated, emptyList(), meta)
+    }
+
+    private fun listInfo(el: J?): ListInfo? {
+        if (el !is J.Obj) return null
+        val id = firstString(el, "id")?.trim().orEmpty()
+        if (id.isEmpty()) return null
+        return ListInfo(id, firstString(el, "name"), firstString(el, "updatedAt", "updated_at"))
     }
 
     private fun groupsFromArray(arr: J.Arr): List<Group> {
@@ -326,7 +397,7 @@ object KitchenAdapter {
         val out = ArrayList<Group>()
         for (el in arr.list) {
             if (el !is J.Obj) continue
-            val name = firstString(el, "name", "aisle", "category", "title", "label") ?: "Other"
+            val name = firstString(el, "aisle", "name", "category", "title", "label") ?: "Other"
             val itemsEl = first(el, "items", "entries", "lines")
             val items = if (itemsEl is J.Arr) itemsEl.list.mapNotNull { parseItem(it) } else emptyList()
             if (items.isNotEmpty()) out.add(Group(name, items))

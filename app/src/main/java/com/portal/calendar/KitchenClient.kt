@@ -13,28 +13,66 @@ import java.net.URL
  * land in a log or an on-screen error.
  */
 object KitchenClient {
+    enum class Status { OK, UNAUTHORIZED, NOT_FOUND, RATE_LIMITED, FAILED }
+
+    class Outcome<T>(val status: Status, val value: T?)
+
+    /** Meals stay on the query string. The calendar feed has no Bearer header. */
     fun fetchMealsIcs(base: String, token: String): String =
         get(KitchenAdapter.mealsUrl(base, token))
 
-    fun fetchGrocery(base: String, token: String): KitchenAdapter.Grocery =
-        KitchenAdapter.parseGrocery(get(KitchenAdapter.groceryUrl(base, token)))
+    /** Grocery GET. Token is sent as Authorization: Bearer, not on the URL. */
+    fun fetchGrocery(base: String, token: String): Outcome<KitchenAdapter.Grocery> {
+        val raw = try {
+            exchange("GET", KitchenAdapter.groceryUrl(base), null, token)
+        } catch (e: IOException) {
+            return Outcome(Status.FAILED, null)
+        }
+        if (raw.code !in 200..299) return Outcome(statusOf(raw.code), null)
+        return try {
+            Outcome(Status.OK, KitchenAdapter.parseGrocery(raw.body))
+        } catch (e: Exception) {
+            Outcome(Status.FAILED, null)
+        }
+    }
 
-    /** @return false when the server rejects the check or can't be reached. */
-    fun setChecked(base: String, token: String, id: String, checked: Boolean): Boolean = try {
-        post(KitchenAdapter.checkUrl(base, token, id), KitchenAdapter.checkBody(checked))
-        true
-    } catch (e: Exception) {
-        false
+    /**
+     * POST the check. On 200 the value is the item the hub returned.
+     * 401, 404, and 429 are distinct so the board can reconnect, drop the row,
+     * or back off instead of treating every failure as a rollback.
+     */
+    fun setChecked(base: String, token: String, id: String, checked: Boolean): Outcome<KitchenAdapter.Item> {
+        val raw = try {
+            exchange("POST", KitchenAdapter.checkUrl(base, id), KitchenAdapter.checkBody(checked), token)
+        } catch (e: IOException) {
+            return Outcome(Status.FAILED, null)
+        }
+        if (raw.code !in 200..299) return Outcome(statusOf(raw.code), null)
+        return try {
+            Outcome(Status.OK, KitchenAdapter.parseCheckedItem(raw.body))
+        } catch (e: Exception) {
+            Outcome(Status.FAILED, null)
+        }
     }
 
     /** GET a fully built hub URL. Throws [IOException] with no URL in the message. */
-    fun get(url: String): String = exchange("GET", url, null)
-
-    private fun post(url: String, body: String) {
-        exchange("POST", url, body)
+    fun get(url: String): String {
+        val raw = exchange("GET", url, null, null)
+        if (raw.code in 300..399) throw IOException("Families Kitchen redirected the request")
+        if (raw.code !in 200..299) throw IOException("Families Kitchen said HTTP ${raw.code}")
+        return raw.body
     }
 
-    private fun exchange(method: String, url: String, body: String?): String {
+    private fun statusOf(code: Int): Status = when (code) {
+        401 -> Status.UNAUTHORIZED
+        404 -> Status.NOT_FOUND
+        429 -> Status.RATE_LIMITED
+        else -> Status.FAILED
+    }
+
+    private class Raw(val code: Int, val body: String)
+
+    private fun exchange(method: String, url: String, body: String?, bearer: String?): Raw {
         val conn = (URL(url).openConnection() as HttpURLConnection)
         try {
             conn.requestMethod = method
@@ -43,6 +81,7 @@ object KitchenClient {
             conn.instanceFollowRedirects = false
             conn.setRequestProperty("Accept", "application/json, text/calendar, */*")
             conn.setRequestProperty("User-Agent", "PortalFamilyCalendar/1.0")
+            if (!bearer.isNullOrEmpty()) conn.setRequestProperty("Authorization", "Bearer $bearer")
             if (body != null) {
                 val bytes = body.toByteArray(Charsets.UTF_8)
                 conn.doOutput = true
@@ -55,14 +94,13 @@ object KitchenClient {
             } catch (e: IOException) {
                 throw IOException("couldn't reach Families Kitchen")
             }
-            if (code in 300..399) throw IOException("Families Kitchen redirected the request")
-            if (code !in 200..299) throw IOException("Families Kitchen said HTTP $code")
             val stream = try {
-                conn.inputStream
+                if (code in 200..299) conn.inputStream else conn.errorStream
             } catch (e: IOException) {
                 null
-            } ?: return ""
-            return readLimited(stream)
+            }
+            val text = if (stream == null) "" else readLimited(stream)
+            return Raw(code, text)
         } catch (e: IOException) {
             val msg = e.message ?: ""
             if (msg.startsWith("Families Kitchen") || msg.startsWith("couldn't reach")) throw e
