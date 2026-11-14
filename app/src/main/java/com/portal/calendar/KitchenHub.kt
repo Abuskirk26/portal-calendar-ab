@@ -42,13 +42,15 @@ object KitchenHub {
         synchronized(lock) {
             // Hide a list that belongs to a hub we are no longer pointed at.
             val show = live != null && boundKey == live
+            val limited = show && rateLimitedKey == live &&
+                System.currentTimeMillis() < rateLimitedUntil
             return Snapshot(
                 live != null,
                 if (show) memory else null,
                 if (show) fetchedAt else 0L,
                 show && offline,
                 show && authFailed,
-                if (show) rateLimitedUntil else 0L
+                if (limited) rateLimitedUntil else 0L
             )
         }
     }
@@ -155,9 +157,17 @@ object KitchenHub {
      */
     fun setChecked(ctx: Context, id: String, checked: Boolean): KitchenAdapter.CheckResult {
         val captured = capture(ctx) ?: return KitchenAdapter.CheckResult.FAILED
-        if (System.currentTimeMillis() < rateLimitedUntil) return KitchenAdapter.CheckResult.RATE_LIMITED
+        synchronized(lock) {
+            // Only the hub that was limited is blocked. Another hub can still be checked.
+            if (captured.key == rateLimitedKey && System.currentTimeMillis() < rateLimitedUntil) {
+                return KitchenAdapter.CheckResult.RATE_LIMITED
+            }
+        }
         val call = KitchenClient.setChecked(captured.base, captured.token, id, checked)
         synchronized(lock) {
+            // This response is for the hub we posted to. If the Portal has since
+            // pointed somewhere else, leave that hub's list alone.
+            if (liveKey(ctx) != captured.key) return KitchenAdapter.CheckResult.SUPERSEDED
             when (call.status) {
                 KitchenClient.Status.UNAUTHORIZED -> {
                     if (boundKey != captured.key) {
