@@ -73,9 +73,12 @@ class GroceryTab(private val ctx: Context) {
             return
         }
         if (grocery == null) {
-            listBox.addView(message(
-                if (snap.offline) "Offline — the grocery list hasn't loaded yet."
-                else "Loading the grocery list…"))
+            listBox.addView(message(when {
+                snap.authFailed -> "Reconnect the hub token in Settings. Families Kitchen didn't accept it."
+                System.currentTimeMillis() < snap.rateLimitedUntil -> "Too many updates — waiting a minute."
+                snap.offline -> "Offline — the grocery list hasn't loaded yet."
+                else -> "Loading the grocery list…"
+            }))
             return
         }
         if (grocery.groups.isEmpty() || grocery.groups.all { it.items.isEmpty() }) {
@@ -123,6 +126,11 @@ class GroceryTab(private val ctx: Context) {
             }
             handler.post {
                 if (stopped) return@post
+                // A fresh snapshot is the server's list. Drop ticks that were
+                // only optimistic, including one a 429 never stored.
+                val keep = HashSet(inflight)
+                val it = pending.keys.iterator()
+                while (it.hasNext()) if (it.next() !in keep) it.remove()
                 render()
                 if (refreshAgain.compareAndSet(true, false)) refresh()
             }
@@ -212,9 +220,9 @@ class GroceryTab(private val ctx: Context) {
                         pending.remove(item.id)
                         refresh()
                     }
-                    // 60/min. Keep the tick we showed and wait. Don't undo it and
-                    // don't fire the POST again.
-                    KitchenAdapter.CheckResult.RATE_LIMITED -> pending[item.id] = next
+                    // 60/min. The hub did not store this check. Show the server
+                    // row again and wait — don't keep a tick the next tap would undo.
+                    KitchenAdapter.CheckResult.RATE_LIMITED -> pending.remove(item.id)
                     KitchenAdapter.CheckResult.UNAUTHORIZED -> pending.remove(item.id)
                 }
                 render()
