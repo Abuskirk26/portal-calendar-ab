@@ -190,6 +190,11 @@ class KitchenAdapterTest {
         assertTrue(KitchenAdapter.acceptFetch(1, 1, a, a))
         assertFalse(KitchenAdapter.acceptFetch(1, 2, a, a)) // a check finished during the GET
         assertFalse(KitchenAdapter.acceptFetch(1, 1, a, b)) // the hub changed during the GET
+        assertEquals(KitchenAdapter.CheckResult.APPLIED, KitchenAdapter.checkOutcome(true, a, a))
+        assertEquals(KitchenAdapter.CheckResult.FAILED, KitchenAdapter.checkOutcome(false, a, a))
+        // Posted successfully, then the device pointed somewhere else: not a failure.
+        assertEquals(KitchenAdapter.CheckResult.SUPERSEDED, KitchenAdapter.checkOutcome(true, a, b))
+        assertEquals(KitchenAdapter.CheckResult.SUPERSEDED, KitchenAdapter.checkOutcome(true, a, null))
     }
 
     @Test fun configPageScriptHasNoOptionalChainingOrNullishCoalescing() {

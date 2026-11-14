@@ -28,6 +28,8 @@ import kotlin.math.roundToInt
 class GroceryTab(private val ctx: Context) {
     private val handler = Handler(Looper.getMainLooper())
     private val refreshing = AtomicBoolean(false)
+    /** A refresh arrived while one was already running — run another when it finishes. */
+    private val refreshAgain = AtomicBoolean(false)
     private val pending = HashMap<String, Boolean>()
     private val inflight = HashSet<String>()
 
@@ -99,14 +101,21 @@ class GroceryTab(private val ctx: Context) {
 
     fun refresh() {
         if (stopped) return
-        if (!refreshing.compareAndSet(false, true)) return
+        if (!refreshing.compareAndSet(false, true)) {
+            refreshAgain.set(true)
+            return
+        }
         Thread {
             try {
                 KitchenHub.refresh(ctx)
             } finally {
                 refreshing.set(false)
             }
-            handler.post { if (!stopped) render() }
+            handler.post {
+                if (stopped) return@post
+                render()
+                if (refreshAgain.compareAndSet(true, false)) refresh()
+            }
         }.start()
     }
 
@@ -172,14 +181,21 @@ class GroceryTab(private val ctx: Context) {
         errorLine = null
         render()
         Thread {
-            val ok = KitchenHub.setChecked(ctx, item.id, next)
+            val result = KitchenHub.setChecked(ctx, item.id, next)
             handler.post {
                 if (stopped) return@post
                 inflight.remove(item.id)
-                val keep = KitchenAdapter.pendingAfterPost(next, ok)
-                if (keep == null) pending.remove(item.id)
-                else pending[item.id] = keep
-                if (!ok) errorLine = "Couldn't update ${item.name} — change undone"
+                when (result) {
+                    KitchenAdapter.CheckResult.APPLIED -> pending[item.id] = next
+                    // The hub we posted to accepted it, but this Portal has since
+                    // switched hubs. Don't show an error, and don't keep the tick
+                    // on the list now on screen.
+                    KitchenAdapter.CheckResult.SUPERSEDED -> pending.remove(item.id)
+                    KitchenAdapter.CheckResult.FAILED -> {
+                        pending.remove(item.id)
+                        errorLine = "Couldn't update ${item.name} — change undone"
+                    }
+                }
                 render()
             }
         }.start()

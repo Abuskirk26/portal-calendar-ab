@@ -180,6 +180,22 @@ object KitchenAdapter {
     fun acceptFetch(startedEpoch: Long, nowEpoch: Long, startedKey: String, nowKey: String): Boolean =
         startedEpoch == nowEpoch && startedKey == nowKey
 
+    /** What the board should do after a check POST. [liveKey] is null when Kitchen was disconnected. */
+    enum class CheckResult { APPLIED, SUPERSEDED, FAILED }
+
+    /**
+     * The POST is reported as a failure only when the hub rejected it.
+     * If the device moved to another hub (or disconnected) while the request
+     * was in flight, the check still happened on the hub it was sent to —
+     * the board must not claim it was undone, and must not write that result
+     * into the new hub's cache.
+     */
+    fun checkOutcome(postOk: Boolean, postedKey: String, liveKey: String?): CheckResult = when {
+        !postOk -> CheckResult.FAILED
+        liveKey == null || liveKey != postedKey -> CheckResult.SUPERSEDED
+        else -> CheckResult.APPLIED
+    }
+
     fun withChecked(grocery: Grocery, id: String, checked: Boolean): Grocery = grocery.copy(
         groups = grocery.groups.map { g ->
             g.copy(items = g.items.map { item ->

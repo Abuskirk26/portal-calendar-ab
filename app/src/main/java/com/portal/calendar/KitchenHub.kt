@@ -30,9 +30,11 @@ object KitchenHub {
     private var epoch: Long = 0
 
     fun snapshot(ctx: Context): Snapshot {
-        val configured = ConfigStore(ctx).kitchenConfigured()
+        val live = liveKey(ctx)
         synchronized(lock) {
-            return Snapshot(configured, memory, fetchedAt, offline)
+            // Hide a list that belongs to a hub we are no longer pointed at.
+            val show = live != null && boundKey == live
+            return Snapshot(live != null, if (show) memory else null, if (show) fetchedAt else 0L, show && offline)
         }
     }
 
@@ -60,68 +62,95 @@ object KitchenHub {
     }
 
     fun refresh(ctx: Context): Snapshot {
-        val store = ConfigStore(ctx)
-        if (!store.kitchenConfigured()) {
+        val captured = capture(ctx)
+        if (captured == null) {
             clear(ctx)
             return snapshot(ctx)
         }
-        val key = KitchenAdapter.hubCacheKey(store.kitchenBase(), store.kitchenToken())
-        val started: Long
-        synchronized(lock) {
-            if (boundKey != key) {
-                memory = null
-                fetchedAt = 0
-                offline = false
-                boundKey = key
-            }
-            started = epoch
-        }
+        // Don't rebind here. A newer hub change must not be overwritten by this
+        // call assigning boundKey back to the hub it started with.
+        val started = synchronized(lock) { epoch }
         try {
-            val grocery = KitchenClient.fetchGrocery(store.kitchenBase(), store.kitchenToken())
+            // Use the URL and token captured above. Re-reading the store here would
+            // fetch the new hub and then file that list under the old hub's key.
+            val grocery = KitchenClient.fetchGrocery(captured.base, captured.token)
             val now = System.currentTimeMillis()
             synchronized(lock) {
-                val current = boundKey ?: ""
-                if (!KitchenAdapter.acceptFetch(started, epoch, key, current)) return@synchronized
+                if (!applyAllowed(ctx, started, captured.key)) return@synchronized
                 memory = grocery
                 fetchedAt = now
                 offline = false
-                writeCache(ctx, grocery, now, key)
+                boundKey = captured.key
+                writeCache(ctx, grocery, now, captured.key)
             }
         } catch (e: Exception) {
             synchronized(lock) {
-                val current = boundKey ?: ""
-                // A newer check, or a switch to another hub, owns the snapshot now.
-                if (!KitchenAdapter.acceptFetch(started, epoch, key, current)) return@synchronized
+                if (!applyAllowed(ctx, started, captured.key)) return@synchronized
                 if (memory == null) {
-                    val cached = readCache(ctx, key)
+                    val cached = readCache(ctx, captured.key)
                     if (cached != null) {
                         memory = cached.first
                         fetchedAt = cached.second
                     }
                 }
                 offline = true
+                boundKey = captured.key
             }
         }
         return snapshot(ctx)
     }
 
-    /** POST the check, then mirror it into the cached list. False = caller rolls back. */
-    fun setChecked(ctx: Context, id: String, checked: Boolean): Boolean {
-        val store = ConfigStore(ctx)
-        if (!store.kitchenConfigured()) return false
-        val key = KitchenAdapter.hubCacheKey(store.kitchenBase(), store.kitchenToken())
-        val ok = KitchenClient.setChecked(store.kitchenBase(), store.kitchenToken(), id, checked)
-        if (!ok) return false
+    /**
+     * POST the check to the hub captured at the start of the call.
+     * [KitchenAdapter.CheckResult.SUPERSEDED] means the hub accepted it, but the
+     * device has since pointed at a different hub (or disconnected) — the caller
+     * drops the optimistic row without showing an error, and nothing is written
+     * into the new hub's cache.
+     */
+    fun setChecked(ctx: Context, id: String, checked: Boolean): KitchenAdapter.CheckResult {
+        val captured = capture(ctx) ?: return KitchenAdapter.CheckResult.FAILED
+        val ok = KitchenClient.setChecked(captured.base, captured.token, id, checked)
         synchronized(lock) {
-            if (boundKey != null && boundKey != key) return false
+            val outcome = KitchenAdapter.checkOutcome(ok, captured.key, liveKey(ctx))
+            if (outcome != KitchenAdapter.CheckResult.APPLIED) return outcome
             epoch++
-            boundKey = key
-            val current = memory ?: return true
+            boundKey = captured.key
+            val current = memory ?: return KitchenAdapter.CheckResult.APPLIED
             val next = KitchenAdapter.withChecked(current, id, checked)
             memory = next
-            writeCache(ctx, next, fetchedAt, key)
+            writeCache(ctx, next, fetchedAt, captured.key)
+            return KitchenAdapter.CheckResult.APPLIED
         }
-        return true
+    }
+
+    private class Captured(val base: String, val token: String, val key: String)
+
+    /** Null when Kitchen is not configured. Reads the store once. */
+    private fun capture(ctx: Context): Captured? {
+        val store = ConfigStore(ctx)
+        if (!store.kitchenConfigured()) return null
+        val base = store.kitchenBase()
+        val token = store.kitchenToken()
+        return Captured(base, token, KitchenAdapter.hubCacheKey(base, token))
+    }
+
+    private fun liveKey(ctx: Context): String? = capture(ctx)?.key
+
+    /**
+     * True when this in-flight call may still write the snapshot. A hub change
+     * drops the previous list instead of filing the response under the old key.
+     * A check that landed during a GET keeps the checked snapshot and ignores the GET.
+     */
+    private fun applyAllowed(ctx: Context, startedEpoch: Long, startedKey: String): Boolean {
+        val live = liveKey(ctx)
+        if (KitchenAdapter.acceptFetch(startedEpoch, epoch, startedKey, live ?: "")) return true
+        if (live != startedKey && boundKey == startedKey) {
+            memory = null
+            fetchedAt = 0
+            offline = false
+            boundKey = live
+        }
+        return false
     }
 
     private fun clear(ctx: Context) {
