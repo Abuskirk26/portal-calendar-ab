@@ -3,6 +3,7 @@ package com.portal.calendar
 import java.math.BigDecimal
 import java.net.URI
 import java.net.URLEncoder
+import java.security.MessageDigest
 import java.time.Instant
 import java.time.ZoneId
 import java.time.ZonedDateTime
@@ -140,18 +141,44 @@ object KitchenAdapter {
     fun pendingAfterPost(requested: Boolean, postOk: Boolean): Boolean? =
         if (postOk) requested else null
 
-    /** Drop overrides the server has caught up with, or whose item is gone. */
-    fun reconcilePending(pending: MutableMap<String, Boolean>, grocery: Grocery) {
+    /**
+     * Drop overrides the server has caught up with, or whose item is gone.
+     * Ids in [inflight] stay put until that POST returns — a list refresh
+     * must not clear a tap that hasn't heard back yet.
+     */
+    fun reconcilePending(
+        pending: MutableMap<String, Boolean>,
+        grocery: Grocery,
+        inflight: Set<String> = emptySet()
+    ) {
         if (pending.isEmpty()) return
         val live = HashMap<String, Boolean>()
         for (g in grocery.groups) for (item in g.items) live[item.id] = item.checked
         val it = pending.entries.iterator()
         while (it.hasNext()) {
             val e = it.next()
+            if (e.key in inflight) continue
             val server = live[e.key]
             if (server == null || server == e.value) it.remove()
         }
     }
+
+    /**
+     * Opaque cache key for one hub. Same URL and token always hash the same;
+     * the token itself is not in the result.
+     */
+    fun hubCacheKey(base: String, token: String): String {
+        val raw = normalizeBase(base) + "\n" + requireToken(token)
+        return MessageDigest.getInstance("MD5").digest(raw.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+    }
+
+    /**
+     * A grocery GET may be applied only if nothing changed while it was in flight:
+     * no successful check (epoch) and no switch of hub (key).
+     */
+    fun acceptFetch(startedEpoch: Long, nowEpoch: Long, startedKey: String, nowKey: String): Boolean =
+        startedEpoch == nowEpoch && startedKey == nowKey
 
     fun withChecked(grocery: Grocery, id: String, checked: Boolean): Grocery = grocery.copy(
         groups = grocery.groups.map { g ->

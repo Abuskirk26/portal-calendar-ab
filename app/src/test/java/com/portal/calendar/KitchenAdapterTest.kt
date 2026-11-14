@@ -172,9 +172,24 @@ class KitchenAdapterTest {
         pending["gone"] = true
         KitchenAdapter.reconcilePending(pending, server)
         assertEquals(setOf("milk"), pending.keys)
+        pending["kale"] = false
+        KitchenAdapter.reconcilePending(pending, server, inflight = setOf("kale"))
+        assertTrue(pending.containsKey("kale")) // still posting — don't drop it
         val flipped = KitchenAdapter.withChecked(server, "milk", true)
         assertTrue(flipped.groups[1].items[0].checked)
         assertFalse(server.groups[1].items[0].checked)
+    }
+
+    @Test fun fetchIsDroppedWhenACheckOrHubChangeLandedFirst() {
+        val a = KitchenAdapter.hubCacheKey("https://families-kitchen.example", "hub token")
+        val b = KitchenAdapter.hubCacheKey("https://families-kitchen.example", "other token")
+        assertEquals(a, KitchenAdapter.hubCacheKey("https://families-kitchen.example/", " hub token "))
+        assertTrue(a != b)
+        assertFalse(a.contains("hub token"))
+        assertFalse(b.contains("other"))
+        assertTrue(KitchenAdapter.acceptFetch(1, 1, a, a))
+        assertFalse(KitchenAdapter.acceptFetch(1, 2, a, a)) // a check finished during the GET
+        assertFalse(KitchenAdapter.acceptFetch(1, 1, a, b)) // the hub changed during the GET
     }
 
     @Test fun configPageScriptHasNoOptionalChainingOrNullishCoalescing() {

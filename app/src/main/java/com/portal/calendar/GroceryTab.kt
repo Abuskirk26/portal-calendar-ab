@@ -50,7 +50,7 @@ class GroceryTab(private val ctx: Context) {
         val snap = KitchenHub.snapshot(ctx)
         lastFetch = snap.fetchedAt
         val grocery = snap.grocery
-        if (grocery != null) KitchenAdapter.reconcilePending(pending, grocery)
+        if (grocery != null) KitchenAdapter.reconcilePending(pending, grocery, inflight)
 
         errorText.text = errorLine ?: ""
         errorText.visibility = if (errorLine.isNullOrEmpty()) View.GONE else View.VISIBLE

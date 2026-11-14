@@ -2881,6 +2881,7 @@ class BoardController(private val baseCtx: Context) {
                 monthOffset = 0
                 dayOffset = 0
                 scheduleOffset = 0
+                renderDinner()
                 renderToday()
                 renderCalendar()
                 // The tabs capture "today" at render time too — a board left
