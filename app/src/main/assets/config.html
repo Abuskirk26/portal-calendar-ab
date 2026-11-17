@@ -415,6 +415,24 @@
   </div>
 
   <div class="card" data-tab="settings">
+    <strong>Families Kitchen</strong>
+    <div style="font-size:13px;color:#737983;margin:6px 0 10px;">Planned meals show on the calendar, and the shopping list gets its own Grocery tab. Paste the site address and the hub token from Families Kitchen. The token stays on this Portal — leave the token box blank when you only want to change the address.</div>
+    <div id="kitStatus" style="font-size:14px;color:#4d535e;margin:8px 0;"></div>
+    <label for="kitBase">Base URL</label>
+    <input type="url" id="kitBase" placeholder="https://families-kitchen.replit.app" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <label for="kitToken">Hub token</label>
+    <div class="row2" style="margin:6px 0 12px;">
+      <input type="password" id="kitToken" placeholder="Hub token" autocomplete="off" autocapitalize="off" spellcheck="false" style="margin:0;flex:1;min-width:0;">
+      <button type="button" class="ghost" id="kitTokenToggle" style="flex:none;padding:10px 14px;" onclick="togglePw('kitToken', this)">Show</button>
+    </div>
+    <div class="btnrow">
+      <button onclick="saveKitchen()">Save</button>
+      <button class="ghost" onclick="clearKitchen()">Disconnect</button>
+    </div>
+    <div id="kitMsg" class="msgline"></div>
+  </div>
+
+  <div class="card" data-tab="settings">
     <strong>Board tabs</strong>
     <div style="font-size:13px;color:#737983;margin:6px 0 10px;">Switch off what your family doesn't use — the tab disappears from the Portal.</div>
     <div id="featRow" style="display:flex;flex-direction:column;gap:10px;">
@@ -422,6 +440,7 @@
       <label style="display:flex;align-items:center;gap:10px;font-size:15px;"><input type="checkbox" id="featLists" onchange="setFeatures()" style="width:20px;height:20px;flex:none;"> Lists</label>
       <label style="display:flex;align-items:center;gap:10px;font-size:15px;"><input type="checkbox" id="featMeals" onchange="setFeatures()" style="width:20px;height:20px;flex:none;"> Meals</label>
       <label style="display:flex;align-items:center;gap:10px;font-size:15px;"><input type="checkbox" id="featRoutines" onchange="setFeatures()" style="width:20px;height:20px;flex:none;"> Routines <span style="font-size:12px;color:#737983;">(kids' get-ready checklists)</span></label>
+      <label style="display:flex;align-items:center;gap:10px;font-size:15px;"><input type="checkbox" id="featGrocery" onchange="setFeatures()" style="width:20px;height:20px;flex:none;"> Grocery <span style="font-size:12px;color:#737983;">(Families Kitchen shopping list)</span></label>
     </div>
     <div id="featMsg" class="msgline"></div>
   </div>
@@ -435,7 +454,7 @@
       <button class="ghost" style="flex:none;" onclick="setPin()">Set PIN</button>
       <button class="ghost" style="flex:none;" onclick="clearPin()">Remove</button>
     </div>
-    <div style="font-size:13px;color:#737983;margin-top:6px;">With a PIN set, adding events, opening Settings, and deleting lists on the Portal's touchscreen ask for it. Kids can still check off chores and list items. This page stays unlocked.</div>
+    <div style="font-size:13px;color:#737983;margin-top:6px;">With a PIN set, adding events, opening Settings, and deleting lists on the Portal's touchscreen ask for it. Kids can still check off chores, list items, and grocery items. This page stays unlocked.</div>
     <div id="pinMsg" class="msgline"></div>
   </div>
 
@@ -505,7 +524,7 @@
 
   <div class="card" data-tab="settings">
     <strong>Backup &amp; copy to another Portal</strong>
-    <p style="font-size:13px;color:#737983;margin:6px 0 10px;">Export everything — calendars, members, chores, lists, meals, layout, <em>and</em> your connected accounts &amp; API key — as one code. Paste it into another Portal's setup page to clone this one. The code contains credentials, so treat it like a password.</p>
+    <p style="font-size:13px;color:#737983;margin:6px 0 10px;">Export everything — calendars, members, chores, lists, meals, layout, <em>and</em> your connected accounts, API key, and Families Kitchen hub token — as one code. Paste it into another Portal's setup page to clone this one. The code contains credentials, so treat it like a password.</p>
     <button class="ghost" style="width:100%;" onclick="exportConfig()">Export this Portal's config</button>
     <textarea id="cfgBlob" placeholder="Exported code appears here — or paste one to import" style="width:100%;height:90px;margin-top:10px;font-family:monospace;font-size:12px;"></textarea>
     <button class="ghost" style="width:100%;margin-top:8px;" onclick="importConfig()">Import / restore from the code above</button>
@@ -859,6 +878,7 @@ async function loadFeatures(){
     document.getElementById('featLists').checked = f.lists;
     document.getElementById('featMeals').checked = f.meals;
     document.getElementById('featRoutines').checked = f.routines;
+    document.getElementById('featGrocery').checked = !!f.grocery;
   } catch(e){ /* page still usable without it */ }
 }
 
@@ -868,6 +888,7 @@ async function setFeatures(){
     lists: document.getElementById('featLists').checked,
     meals: document.getElementById('featMeals').checked,
     routines: document.getElementById('featRoutines').checked,
+    grocery: document.getElementById('featGrocery').checked,
   };
   try {
     const r = await fetch('/api/features', {method:'POST', body: JSON.stringify(body)});
@@ -877,6 +898,7 @@ async function setFeatures(){
     document.getElementById('featLists').checked = f.lists;
     document.getElementById('featMeals').checked = f.meals;
     document.getElementById('featRoutines').checked = f.routines;
+    document.getElementById('featGrocery').checked = !!f.grocery;
     show('featMsg', 'Board tabs updated', true);
   } catch(e){ show('featMsg', e.message, false); loadFeatures(); }
 }
@@ -1311,7 +1333,8 @@ function toggleDay(v){
 }
 
 function memberName(id){
-  const m = (choreStatus?.members || []).find(m => m.id === id);
+  const members = (choreStatus && choreStatus.members) || [];
+  const m = members.find(function (mem) { return mem.id === id; });
   return m ? m.name : 'Anyone';
 }
 
@@ -1450,7 +1473,8 @@ function toggleRoutineDay(v){
 }
 
 function routineMemberName(id){
-  const m = (routineStatus?.members || []).find(m => m.id === id);
+  const members = (routineStatus && routineStatus.members) || [];
+  const m = members.find(function (mem) { return mem.id === id; });
   return m ? m.name : 'Anyone';
 }
 
@@ -2235,7 +2259,7 @@ function showWizard(){
 async function exitWizard(){
   try { await fetch('/api/setup', {method:'POST', body:'{}'}); } catch(e){}
   document.getElementById('wizard').style.display = 'none';
-  load(); loadSaver(); loadEffects(); loadFeatures(); loadSync(); loadWriters(); loadScale(); loadWx(); loadPin();
+  load(); loadSaver(); loadEffects(); loadFeatures(); loadSync(); loadWriters(); loadScale(); loadWx(); loadPin(); loadKitchen();
 }
 
 async function maybeStartWizard(){
@@ -2407,9 +2431,48 @@ async function importConfig(){
   } catch(e){ show('cfgMsg', e.message, false); }
 }
 
+async function loadKitchen(){
+  try {
+    const st = await (await fetch('/api/kitchen')).json();
+    const base = document.getElementById('kitBase');
+    const token = document.getElementById('kitToken');
+    if (document.activeElement !== base) base.value = st.base || '';
+    token.value = '';
+    token.placeholder = st.hasToken ? 'Token saved — leave blank to keep it' : 'Hub token';
+    document.getElementById('kitStatus').textContent = st.configured
+      ? 'Connected. Meals show on the calendar, and Grocery can be opened on the board.'
+      : 'Not connected.';
+  } catch (e) { /* page still usable without it */ }
+}
+
+async function saveKitchen(){
+  const base = document.getElementById('kitBase').value.trim();
+  const token = document.getElementById('kitToken').value;
+  try {
+    const r = await fetch('/api/kitchen', {method:'POST', body: JSON.stringify({base: base, token: token})});
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.error || 'failed');
+    show('kitMsg', 'Families Kitchen saved', true);
+    loadKitchen();
+    loadFeatures();
+  } catch (e) { show('kitMsg', e.message, false); }
+}
+
+async function clearKitchen(){
+  try {
+    const r = await fetch('/api/kitchen', {method:'POST', body: JSON.stringify({base: '', token: ''})});
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.error || 'failed');
+    show('kitMsg', 'Families Kitchen disconnected', true);
+    loadKitchen();
+    loadFeatures();
+  } catch (e) { show('kitMsg', e.message, false); }
+}
+
 loadSaver();
 loadEffects();
 loadFeatures();
+loadKitchen();
 loadSync();
 loadWriters();
 loadScale();

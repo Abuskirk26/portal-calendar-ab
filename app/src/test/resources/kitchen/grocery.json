@@ -1,0 +1,30 @@
+{
+  "list": {
+    "id": "list_1",
+    "name": "This week",
+    "updatedAt": "2026-11-14T22:30:00.000Z"
+  },
+  "groups": [
+    {
+      "aisle": "produce",
+      "items": [
+        {
+          "id": "item_1",
+          "name": "Onion",
+          "quantity": 2,
+          "unit": "lb",
+          "checked": false,
+          "updatedAt": "2026-11-14T22:05:00.000Z"
+        },
+        {
+          "id": "item_2",
+          "name": "Lemon",
+          "quantity": null,
+          "unit": null,
+          "checked": true,
+          "updatedAt": "2026-11-14T22:06:00.000Z"
+        }
+      ]
+    }
+  ]
+}

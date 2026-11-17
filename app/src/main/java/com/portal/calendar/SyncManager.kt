@@ -28,7 +28,13 @@ data class EventInstance(
     /** True for any occurrence of a repeating series (deleting removes all). */
     val recurring: Boolean = false,
     /** Text color for anywhere [color] is a solid fill behind this event's text. */
-    val textColor: Int = Color.WHITE
+    val textColor: Int = Color.WHITE,
+    /** Cook-now link (Families Kitchen meals). */
+    val url: String? = null,
+    /** Families Kitchen meal — meal icon, distinct color, not deleted through calendar sync. */
+    val meal: Boolean = false,
+    /** Feed labeled this occurrence as dinner (title or category). */
+    val dinner: Boolean = false
 )
 
 /**
@@ -42,7 +48,8 @@ class SyncManager(private val ctx: Context, private val store: ConfigStore) {
 
     fun requestSync(onDone: (events: List<EventInstance>, problems: List<String>) -> Unit) {
         executor.execute {
-            val feeds = store.feeds()
+            val feeds = ArrayList(store.feeds())
+            store.kitchenFeed()?.let { feeds.add(it) }
             val all = ArrayList<EventInstance>()
             val problems = ArrayList<String>()
             // CalDAV servers that didn't answer at all during this pass (connect/timeout, not an
@@ -71,7 +78,11 @@ class SyncManager(private val ctx: Context, private val store: ConfigStore) {
         try {
             if (origin != null && origin in unreachable)   // already timed out on this server: straight to the cache
                 throw CalDavUnreachable(CalDavXml.hostOf(feed.url), "couldn't reach ${CalDavXml.hostOf(feed.url)}")
-            val text = if (feed.source == "caldav") CalDav.fetchIcs(ctx, feed.url) else fetchIcsText(feed.url)
+            val text = when {
+                feed.source == "caldav" -> CalDav.fetchIcs(ctx, feed.url)
+                feed.meal -> KitchenClient.get(feed.url)
+                else -> fetchIcsText(feed.url)
+            }
             if (!text.contains("BEGIN:VCALENDAR"))
                 throw RuntimeException("not an iCal feed")
             // Atomic: a crash mid-write must not corrupt the offline copy.
@@ -84,13 +95,20 @@ class SyncManager(private val ctx: Context, private val store: ConfigStore) {
             // CalDAV errors are already readable ("CalDAV account not connected", "sign-in
             // failed…"), so say what happened instead of a bare "offline".
             val reason = if (feed.source == "caldav" && e is IllegalArgumentException) e.message else null
+            // Meal-feed errors must not include the request URL — the hub token is in it.
+            val failed = when {
+                reason != null -> reason
+                feed.meal -> "couldn't reach Families Kitchen"
+                else -> "fetch failed (${e.message ?: e.javaClass.simpleName})"
+            }
             return if (cache.exists()) {
                 problems.add("${feed.name}: " +
-                    (if (reason != null) "$reason (showing cached copy)" else "offline, showing cached copy"))
+                    (if (feed.meal) "offline, showing cached copy"
+                    else if (reason != null) "$reason (showing cached copy)"
+                    else "offline, showing cached copy"))
                 cache.readText()
             } else {
-                problems.add("${feed.name}: " +
-                    (reason ?: "fetch failed (${e.message ?: e.javaClass.simpleName})"))
+                problems.add("${feed.name}: $failed")
                 null
             }
         }
@@ -143,36 +161,44 @@ class SyncManager(private val ctx: Context, private val store: ConfigStore) {
                 if (evUid.isNotEmpty() && evUid in suppressed) continue // deleted from the board
 
                 // Magic-word events route to lists/chores and never render.
-                val magic = MagicWords.match(e.summary?.value ?: "")
-                if (magic != null) {
-                    val uid = e.uid?.value ?: (feed.url + (e.summary?.value ?: ""))
-                    // Mark AFTER a successful execute so a failed command
-                    // retries next sync instead of being consumed silently.
-                    if (!MagicWords.isProcessed(ctx, uid)) {
-                        runCatching { MagicWords.execute(ctx, magic, ds.value.time) }
-                            .onSuccess { MagicWords.markProcessed(ctx, uid) }
+                // Meal feeds skip this: a recipe title must stay on the board, and
+                // the fallback id would otherwise embed the hub token (it's in the URL).
+                if (!feed.meal) {
+                    val magic = MagicWords.match(e.summary?.value ?: "")
+                    if (magic != null) {
+                        val uid = e.uid?.value ?: (feed.url + (e.summary?.value ?: ""))
+                        // Mark AFTER a successful execute so a failed command
+                        // retries next sync instead of being consumed silently.
+                        if (!MagicWords.isProcessed(ctx, uid)) {
+                            runCatching { MagicWords.execute(ctx, magic, ds.value.time) }
+                                .onSuccess { MagicWords.markProcessed(ctx, uid) }
+                        }
+                        continue
                     }
-                    continue
                 }
 
                 val allDay = !ds.value.hasTime()
                 val durMs = durationMs(e, allDay)
                 val title = e.summary?.value?.trim().takeUnless { it.isNullOrEmpty() } ?: "(untitled)"
                 val loc = e.location?.value?.trim().takeUnless { it.isNullOrEmpty() }
+                val cook = if (feed.meal) KitchenAdapter.cookUrl(e.url?.value, e.description?.value) else null
+                val dinnerHint = feed.meal && (KitchenAdapter.looksLikeDinner(title) ||
+                    categoriesText(e).contains("dinner", ignoreCase = true))
+                fun emit(startMs: Long, recurringFlag: Boolean) {
+                    if (startMs + durMs >= windowStart && startMs <= windowEnd)
+                        out.add(EventInstance(startMs, startMs + durMs, allDay, title, loc, feed.name,
+                            feed.color, evUid, recurringFlag, textColor, cook, feed.meal, dinnerHint))
+                }
 
                 if (e.recurrenceId != null) {
                     // Edited single instance: add as-is (part of a series).
-                    val s = ds.value.time
-                    if (s + durMs >= windowStart && s <= windowEnd)
-                        out.add(EventInstance(s, s + durMs, allDay, title, loc, feed.name, feed.color, evUid, true, textColor))
+                    emit(ds.value.time, true)
                     continue
                 }
 
                 val recurring = e.recurrenceRule != null || e.recurrenceDates.isNotEmpty()
                 if (!recurring) {
-                    val s = ds.value.time
-                    if (s + durMs >= windowStart && s <= windowEnd)
-                        out.add(EventInstance(s, s + durMs, allDay, title, loc, feed.name, feed.color, evUid, false, textColor))
+                    emit(ds.value.time, false)
                 } else {
                     val skips = e.uid?.value?.let { overridden[it] }
                     // Honors RRULE + RDATE + EXDATE. Expand in the EVENT's own
@@ -189,7 +215,7 @@ class SyncManager(private val ctx: Context, private val store: ConfigStore) {
                         if (occ.time > windowEnd) break
                         if (occ.time + durMs < windowStart) continue
                         if (skips?.contains(occ.time) == true) continue
-                        out.add(EventInstance(occ.time, occ.time + durMs, allDay, title, loc, feed.name, feed.color, evUid, true, textColor))
+                        emit(occ.time, true)
                     }
                 }
             }
@@ -273,6 +299,19 @@ class SyncManager(private val ctx: Context, private val store: ConfigStore) {
             return c.timeInMillis - start
         }
         return 0
+    }
+
+    private fun categoriesText(e: VEvent): String {
+        val cats = e.categories ?: return ""
+        val out = StringBuilder()
+        for (c in cats) {
+            val values = c.values ?: continue
+            for (v in values) {
+                if (out.isNotEmpty()) out.append(' ')
+                out.append(v)
+            }
+        }
+        return out.toString()
     }
 
     private fun md5(s: String): String =

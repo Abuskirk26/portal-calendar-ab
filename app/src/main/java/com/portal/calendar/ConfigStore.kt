@@ -17,7 +17,12 @@ data class FeedConfig(
      * "ics" (default): [url] is a published iCal/webcal link. "caldav": [url] is a calendar
      * collection on the connected CalDAV account, read with its credentials (see [CalDav.fetchIcs]).
      */
-    val source: String = "ics") {
+    val source: String = "ics",
+    /**
+     * Families Kitchen meals feed. Not stored in the feed list — built by
+     * [ConfigStore.kitchenFeed] so the hub token never sits in the calendar editor.
+     */
+    val meal: Boolean = false) {
     /** The concrete text color for [text] on [color] (see [Palette.textOn]). */
     val textColor: Int get() = Palette.textOn(color, text)
 }
@@ -160,6 +165,52 @@ class ConfigStore(ctx: Context) {
         prefs.edit().putString("theme", clean).commit()
     }
 
+    /**
+     * Families Kitchen origin, with no trailing slash and no token.
+     * Empty until someone saves it on the setup page.
+     */
+    fun kitchenBase(): String = (prefs.getString(KEY_KITCHEN_BASE, "") ?: "").trim()
+
+    /** Hub token. Never returned by [kitchenStatusJson] and never logged. */
+    fun kitchenToken(): String = prefs.getString(KEY_KITCHEN_TOKEN, "") ?: ""
+
+    fun kitchenConfigured(): Boolean = kitchenBase().isNotEmpty() && kitchenToken().isNotEmpty()
+
+    fun kitchenStatusJson(): String = org.json.JSONObject()
+        .put("configured", kitchenConfigured())
+        .put("base", kitchenBase())
+        .put("hasToken", kitchenToken().isNotEmpty())
+        .toString()
+
+    /**
+     * Saves the base URL and hub token. A blank base clears both. A blank token
+     * keeps the one already saved, so the phone page can edit the URL without
+     * re-pasting the secret. Throws [IllegalArgumentException] on bad input.
+     */
+    fun setKitchen(baseRaw: String, tokenRaw: String) {
+        val baseIn = baseRaw.trim()
+        if (baseIn.isEmpty()) {
+            prefs.edit().remove(KEY_KITCHEN_BASE).remove(KEY_KITCHEN_TOKEN).commit()
+            return
+        }
+        val base = KitchenAdapter.normalizeBase(baseIn)
+        val typed = tokenRaw.trim()
+        val token = if (typed.isEmpty()) kitchenToken() else KitchenAdapter.requireToken(typed)
+        if (token.isEmpty()) throw IllegalArgumentException("a hub token is required")
+        prefs.edit().putString(KEY_KITCHEN_BASE, base).putString(KEY_KITCHEN_TOKEN, token).commit()
+    }
+
+    /** Synthetic calendar feed for planned meals, or null when Kitchen isn't connected. */
+    fun kitchenFeed(): FeedConfig? {
+        if (!kitchenConfigured()) return null
+        return FeedConfig(
+            KitchenAdapter.FEED_NAME,
+            KitchenAdapter.MEAL_COLOR,
+            KitchenAdapter.mealsUrl(kitchenBase(), kitchenToken()),
+            text = "white",
+            meal = true)
+    }
+
     /** Resolves the theme to dark-on/off right now (for auto/system). */
     fun isDark(ctx: Context): Boolean = when (theme()) {
         "dark" -> true
@@ -176,6 +227,8 @@ class ConfigStore(ctx: Context) {
 
     companion object {
         private const val KEY = "feeds"
+        private const val KEY_KITCHEN_BASE = "kitchen_base"
+        private const val KEY_KITCHEN_TOKEN = "kitchen_token"
 
         /** A feed's text setting: "black" / "auto" as given, anything else (or missing) = "white". */
         fun cleanText(raw: String?): String = when (raw?.trim()?.lowercase()) {
